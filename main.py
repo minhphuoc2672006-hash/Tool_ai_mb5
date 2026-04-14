@@ -1,9 +1,8 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Telegram bot phân tích Tài/Xỉu với:
-- Lưu lịch sử vào SQLite
+- Lưu lịch sử vào SQLite (không giới hạn)
 - Nhận diện cầu sâu: lặp, xen kẽ, chuyển pha, chu kỳ, mẫu động
 - Lọc nhiễu bằng chaos/confidence/consensus
 - Biểu đồ cầu và biểu đồ xí ngầu
@@ -59,9 +58,9 @@ LOW_LABEL = os.getenv("LOW_LABEL", "Xỉu")
 HIGH_LABEL = os.getenv("HIGH_LABEL", "Tài")
 
 RECENT_CACHE = int(os.getenv("RECENT_CACHE", "500"))
-HISTORY_ANALYSIS_LIMIT = int(os.getenv("HISTORY_ANALYSIS_LIMIT", "0"))
-MAX_KEEP_HISTORY = int(os.getenv("MAX_KEEP_HISTORY", "0"))
-MAX_INPUT_NUMS = int(os.getenv("MAX_INPUT_NUMS", "120"))
+HISTORY_ANALYSIS_LIMIT = int(os.getenv("HISTORY_ANALYSIS_LIMIT", "0"))  # 0 = đọc toàn bộ
+MAX_KEEP_HISTORY = int(os.getenv("MAX_KEEP_HISTORY", "0"))              # 0 = không giới hạn, không xóa
+MAX_INPUT_NUMS = int(os.getenv("MAX_INPUT_NUMS", "1000000"))
 USER_CACHE_LIMIT = int(os.getenv("USER_CACHE_LIMIT", "500"))
 MIN_ANALYSIS_LEN = int(os.getenv("MIN_ANALYSIS_LEN", "6"))
 
@@ -262,6 +261,7 @@ def init_db() -> None:
             conn.commit()
 
 def prune_history(conn: sqlite3.Connection, chat_id: int, keep_limit: int) -> None:
+    # Không xóa gì nếu keep_limit <= 0
     if keep_limit <= 0:
         return
     row = conn.execute(
@@ -278,11 +278,10 @@ async def append_history(chat_id: int, items: List[Tuple[int, str]]) -> None:
     def _work():
         try:
             with db_connect() as conn:
-                for raw_value, label in items:
-                    conn.execute(
-                        "INSERT INTO history (chat_id, raw_value, label) VALUES (?, ?, ?)",
-                        (chat_id, int(raw_value), str(label)),
-                    )
+                conn.executemany(
+                    "INSERT INTO history (chat_id, raw_value, label) VALUES (?, ?, ?)",
+                    [(chat_id, int(raw_value), str(label)) for raw_value, label in items],
+                )
                 prune_history(conn, chat_id, MAX_KEEP_HISTORY)
                 conn.commit()
         except Exception as e:
@@ -455,7 +454,6 @@ async def save_state(chat_id: int, state: Dict[str, Any]) -> None:
                     """,
                     (chat_id, json.dumps(state, ensure_ascii=False, default=str)),
                 )
-                prune_history(conn, chat_id, MAX_KEEP_HISTORY)
                 conn.commit()
         except Exception as e:
             logger.exception("save_state failed: %s", e)
@@ -466,49 +464,45 @@ async def save_state(chat_id: int, state: Dict[str, Any]) -> None:
 
 # ===================== INPUT PARSER =====================
 def parse_input(text: str) -> Tuple[List[int], List[List[int]]]:
+    """
+    - Mặc định: mọi số nguyên người dùng nhập sẽ được lưu nguyên vẹn vào history.
+    - Không tự ghép nhầm 1..6 thành xí ngầu.
+    - Xí ngầu chỉ được nhận khi người dùng nhập rất rõ dạng có dấu phân cách như | ; / hoặc xuống dòng.
+    """
     text = (text or "").strip()
     if not text:
         return [], []
-    tokens = re.findall(r"\d+", text)
+
+    tokens = re.findall(r"-?\d+", text)
     if not tokens:
         return [], []
 
-    if len(tokens) == 1:
-        tok = tokens[0]
-        if len(tok) == 3 and all(ch in "123456" for ch in tok):
-            faces = [int(ch) for ch in tok]
-            return [sum(faces)], [faces]
+    nums: List[int] = []
+    for tok in tokens:
         try:
             n = int(tok)
-            return ([n] if n >= 0 else []), []
-        except Exception:
-            return [], []
-
-    if all(1 <= int(x) <= 6 for x in tokens):
-        totals: List[int] = []
-        dice_rolls: List[List[int]] = []
-        i = 0
-        while i + 3 <= len(tokens):
-            faces = [int(v) for v in tokens[i:i + 3]]
-            totals.append(sum(faces))
-            dice_rolls.append(faces)
-            i += 3
-        while i < len(tokens):
-            n = int(tokens[i])
             if n >= 0:
-                totals.append(n)
-            i += 1
-        return totals[:MAX_INPUT_NUMS], dice_rolls[:MAX_INPUT_NUMS]
-
-    out: List[int] = []
-    for x in tokens:
-        try:
-            n = int(x)
-            if n >= 0:
-                out.append(n)
+                nums.append(n)
         except Exception:
             continue
-    return out[:MAX_INPUT_NUMS], []
+
+    dice_rolls: List[List[int]] = []
+    if any(sep in text for sep in ["|", ";", "/"]):
+        parts = re.split(r"[|;/\n]+", text)
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            face_tokens = re.findall(r"\d+", part)
+            if len(face_tokens) == 3:
+                try:
+                    faces = [int(x) for x in face_tokens]
+                    if all(1 <= x <= 6 for x in faces):
+                        dice_rolls.append(faces)
+                except Exception:
+                    continue
+
+    return nums[:MAX_INPUT_NUMS], dice_rolls[:MAX_INPUT_NUMS]
 
 HEX_HASH_RE = re.compile(r"(?=.*[a-fA-F])[0-9a-fA-F]{16,}$")
 def is_hash_like(text: str) -> bool:
@@ -1250,7 +1244,6 @@ def prediction_gate(labels: List[str], report: Dict[str, Any], state: Optional[D
         return False, "Không có cầu rõ ràng để phân tích"
 
     top = patterns[0]
-    top_name = str(top.get("name", "-"))
     top_score = int(top.get("score", 0))
     chaos = int(report.get("chaos_score", 0))
     structure_hint = str(report.get("structure_hint", ""))
@@ -1259,15 +1252,15 @@ def prediction_gate(labels: List[str], report: Dict[str, Any], state: Optional[D
         return False, f"Chưa đủ {MIN_PREDICTION_DATA} dữ liệu"
 
     if top_score >= 70 and chaos <= 72 and structure_hint != "CẦU LOẠN":
-        return True, f"Bắt nhanh: {top_name} ({top_score}%)"
+        return True, f"Bắt nhanh: {top.get('name', '-') } ({top_score}%)"
 
     if top_score >= 58 and chaos <= 62 and structure_hint != "CẦU LOẠN":
-        return True, f"Có cầu: {top_name} ({top_score}%)"
+        return True, f"Có cầu: {top.get('name', '-') } ({top_score}%)"
 
     if top_score >= 54 and total >= 6 and report.get("repeat_count", 0) >= 1:
-        return True, f"Có nhịp mới: {top_name} ({top_score}%)"
+        return True, f"Có nhịp mới: {top.get('name', '-') } ({top_score}%)"
 
-    return False, f"Cầu còn yếu: {top_name} ({top_score}%)"
+    return False, f"Cầu còn yếu: {top.get('name', '-') } ({top_score}%)"
 
 def predict_pattern(labels: List[str], report: Dict[str, Any]) -> Dict[str, Any]:
     patterns = report.get("patterns", [])
@@ -1626,6 +1619,7 @@ def analyze_state_from_labels(state: Dict[str, Any], labels_full: List[str], dic
         state["last_web_scan_name"] = ""
         state["last_web_scan_detail"] = ""
         state["last_web_scan_score"] = 0
+
     state["dice_deep_summary"] = (
         f"D1:{dice_summary['avg_faces'][0]:.2f}±{dice_summary['std_faces'][0]:.2f}, "
         f"D2:{dice_summary['avg_faces'][1]:.2f}±{dice_summary['std_faces'][1]:.2f}, "
