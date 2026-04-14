@@ -14,6 +14,8 @@ bot = telebot.TeleBot(TOKEN)
 # ================= DATA =================
 history = []
 
+MAX_HISTORY = 300  # 🔥 chống lệch lâu dài
+
 # ================= LOAD MODEL =================
 def load_model():
     try:
@@ -28,14 +30,12 @@ model = load_model()
 def is_admin(msg):
     return msg.from_user.id == ADMIN_ID
 
-# ================= PARSE INPUT =================
+# ================= PARSE =================
 def parse_input(text):
-    # nhận: "14-5-10" hoặc "12"
     try:
         if "-" in text:
             return [int(x) for x in text.split("-") if x.strip().isdigit()]
-        else:
-            return [int(text)]
+        return [int(text)]
     except:
         return []
 
@@ -71,12 +71,9 @@ def detect_cycle():
     if seq[:4] == seq[4:]:
         return "Chu kỳ lặp 4"
 
-    if seq == [1,0,1,0,1,0,1,0] or seq == [0,1,0,1,0,1,0,1]:
-        return "Chu kỳ 1-1"
-
     return "Nhiễu"
 
-# ================= AI =================
+# ================= AI (FIXED MARKOV) =================
 def predict_ai():
     if len(history) < 3:
         return None, 0
@@ -87,13 +84,19 @@ def predict_ai():
         t, x = model[key]
         total = t + x
 
-        if total == 0:
-            return None, 0
+        if total < 2:
+            return None, 0.5
 
-        prob = max(t, x) / total
-        return (1 if t > x else 0), prob
+        prob_t = t / total
+        prob_x = x / total
 
-    return None, 0
+        # 🔥 nếu quá sát nhau → bỏ AI
+        if abs(prob_t - prob_x) < 0.08:
+            return None, 0.5
+
+        return (1 if prob_t > prob_x else 0), max(prob_t, prob_x)
+
+    return None, 0.5
 
 # ================= TRAIN =================
 def train_model():
@@ -105,8 +108,7 @@ def train_model():
     with open("data.txt") as f:
         for line in f:
             try:
-                n = int(line.strip())
-                data.append(to_tx(n))
+                data.append(to_tx(int(line.strip())))
             except:
                 continue
 
@@ -126,60 +128,71 @@ def train_model():
 
     return new_model
 
-# ================= VOTE =================
+# ================= ANTI BIAS =================
+def get_bias():
+    if len(history) < 10:
+        return 0.5
+    return sum(history) / len(history)
+
+# ================= VOTE (FIXED) =================
 def vote(pattern, cycle, ai):
     if not history:
-        return "Không rõ", 0
+        return "Không rõ", 0.5
 
     score_t = 0
     score_x = 0
 
     last = history[-1]
 
-    # pattern
+    # ===== PATTERN =====
     if pattern == "Bệt":
-        if last == 1:
-            score_t += 2
-        else:
-            score_x += 2
+        score_t += 2 if last == 1 else 0
+        score_x += 2 if last == 0 else 0
 
     elif pattern == "1-1":
-        if last == 1:
-            score_x += 2
-        else:
-            score_t += 2
+        score_t += 2 if last == 0 else 0
+        score_x += 2 if last == 1 else 0
 
     elif pattern == "2-2":
         score_t += 1
         score_x += 1
 
-    # cycle
+    # ===== CYCLE =====
     if "lặp" in cycle:
-        if last == 1:
-            score_t += 1
-        else:
-            score_x += 1
+        score_t += 0.5 if last == 1 else 0
+        score_x += 0.5 if last == 0 else 0
 
-    # AI
+    # ===== AI (GIẢM ẢNH HƯỞNG) =====
     if ai is not None:
-        if ai == 1:
-            score_t += 3
-        else:
-            score_x += 3
+        score_t += 1.5 if ai == 1 else 0
+        score_x += 1.5 if ai == 0 else 0
+
+    # ===== ANTI BIAS FIX =====
+    bias = get_bias()
+
+    if bias > 0.65:
+        score_x += 0.8
+    elif bias < 0.35:
+        score_t += 0.8
 
     total = score_t + score_x
 
     if total == 0:
-        return "Không rõ", 0
+        return "Không rõ", 0.5
 
-    return ("TÀI", score_t/total) if score_t > score_x else ("XỈU", score_x/total)
+    prob_t = score_t / total
+
+    if abs(prob_t - 0.5) < 0.05:
+        return "Không rõ", 0.5
+
+    return ("TÀI", prob_t) if prob_t > 0.5 else ("XỈU", 1 - prob_t)
 
 # ================= START =================
 @bot.message_handler(commands=['start'])
 def start(msg):
     if not is_admin(msg):
         return
-    bot.reply_to(msg, "BOT AI PRO UPGRADED READY 🚀")
+    bot.reply_to(msg, "BOT AI PRO FIXED + ANTI-BIAS 🚀")
 
 # ================= RESET =================
 @bot.message_handler(commands=['reset'])
@@ -187,7 +200,7 @@ def reset(msg):
     if not is_admin(msg):
         return
     history.clear()
-    bot.reply_to(msg, "Đã reset history")
+    bot.reply_to(msg, "Reset xong")
 
 # ================= HANDLE =================
 @bot.message_handler(func=lambda m: True)
@@ -204,15 +217,15 @@ def handle(msg):
         return
 
     for num in nums:
+        if 3 <= num <= 18:
+            history.append(to_tx(num))
 
-        if num < 3 or num > 18:
-            continue
+            with open("data.txt", "a") as f:
+                f.write(str(num) + "\n")
 
-        tx = to_tx(num)
-        history.append(tx)
-
-        with open("data.txt", "a") as f:
-            f.write(str(num) + "\n")
+    # 🔥 chống drift
+    if len(history) > MAX_HISTORY:
+        history[:] = history[-MAX_HISTORY:]
 
     # auto train
     if len(history) % 200 == 0:
