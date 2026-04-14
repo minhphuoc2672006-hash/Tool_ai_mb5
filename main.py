@@ -1,171 +1,228 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
+import telebot
+import pickle
 import os
-import re
-import sqlite3
-from typing import List
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-DB_FILE = "history.db"
+# ===== ENV (ẨN TOKEN) =====
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-THRESHOLD = 11
-ANALYSIS_WINDOW = 200
+bot = telebot.TeleBot(TOKEN)
 
-# ================= DB =================
-def db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
+history = []
 
-def init_db():
-    with db() as c:
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
-            value INTEGER,
-            label TEXT
-        )
-        """)
+# ===== LOAD MODEL =====
+def load_model():
+    global model
+    try:
+        with open("model.pkl", "rb") as f:
+            model = pickle.load(f)
+    except:
+        model = {}
 
-# ================= PARSE =================
-def parse_numbers(text: str) -> List[int]:
-    return [int(x) for x in re.findall(r"\d+", text)]
+load_model()
 
-def classify(n: int) -> str:
-    return "Tài" if n >= THRESHOLD else "Xỉu"
+# ===== CHECK ADMIN =====
+def is_admin(msg):
+    return msg.from_user.id == ADMIN_ID
 
-# ================= SAVE =================
-def save_bulk(chat_id, nums):
-    with db() as c:
-        c.executemany(
-            "INSERT INTO history (chat_id, value, label) VALUES (?, ?, ?)",
-            [(chat_id, n, classify(n)) for n in nums]
-        )
+# ===== CẦU =====
+def detect_pattern():
+    if len(history) < 4:
+        return "Chưa rõ"
 
-def save_one(chat_id, n):
-    with db() as c:
-        c.execute(
-            "INSERT INTO history (chat_id, value, label) VALUES (?, ?, ?)",
-            (chat_id, n, classify(n))
-        )
+    last = history[-4:]
 
-# ================= LOAD =================
-def get_recent(chat_id):
-    with db() as c:
-        rows = c.execute(
-            "SELECT label FROM history WHERE chat_id=? ORDER BY id DESC LIMIT ?",
-            (chat_id, ANALYSIS_WINDOW)
-        ).fetchall()
-    return [r[0] for r in rows][::-1]
+    if last == [1,1,1,1] or last == [0,0,0,0]:
+        return "Bệt"
 
-# ================= ANALYSIS =================
-def analyze(labels):
-    if len(labels) < 20:
-        return "Chưa đủ dữ liệu"
+    if last == [1,0,1,0] or last == [0,1,0,1]:
+        return "1-1"
 
-    last = labels[-1]
+    if last == [1,1,0,0] or last == [0,0,1,1]:
+        return "2-2"
 
-    # ===== STREAK =====
-    streak = 1
-    for i in range(len(labels)-2, -1, -1):
-        if labels[i] == last:
-            streak += 1
+    return "Gãy"
+
+# ===== CHU KỲ SÂU =====
+def detect_cycle():
+    if len(history) < 8:
+        return "Không rõ"
+
+    seq = history[-8:]
+
+    # lặp 4-4
+    if seq[:4] == seq[4:]:
+        return "Chu kỳ lặp 4"
+
+    # 1-1 dài
+    if seq == [1,0,1,0,1,0,1,0] or seq == [0,1,0,1,0,1,0,1]:
+        return "Chu kỳ 1-1"
+
+    return "Nhiễu"
+
+# ===== AI =====
+def predict_ai():
+    if len(history) < 3:
+        return None, 0
+
+    key = tuple(history[-3:])
+
+    if key in model:
+        t, x = model[key]
+        total = t + x
+
+        if total == 0:
+            return None, 0
+
+        prob = max(t, x) / total
+        return (1 if t > x else 0), prob
+
+    return None, 0
+
+# ===== TRAIN =====
+def train_model():
+    data = []
+
+    if not os.path.exists("data.txt"):
+        return model
+
+    with open("data.txt") as f:
+        for line in f:
+            try:
+                n = int(line.strip())
+                tx = 1 if n >= 11 else 0
+                data.append(tx)
+            except:
+                continue
+
+    model_new = {}
+
+    for i in range(len(data)-3):
+        key = tuple(data[i:i+3])
+        nxt = data[i+3]
+
+        if key not in model_new:
+            model_new[key] = [0, 0]
+
+        model_new[key][nxt] += 1
+
+    with open("model.pkl", "wb") as f:
+        pickle.dump(model_new, f)
+
+    return model_new
+
+# ===== VOTE =====
+def vote(pattern, cycle, ai):
+    score_tai = 0
+    score_xiu = 0
+
+    # cầu
+    if pattern == "Bệt":
+        if history[-1] == 1:
+            score_tai += 2
         else:
-            break
+            score_xiu += 2
 
-    # ===== MARKOV =====
-    trans = {"Tài": {"Tài":0,"Xỉu":0}, "Xỉu":{"Tài":0,"Xỉu":0}}
-    for i in range(len(labels)-1):
-        trans[labels[i]][labels[i+1]] += 1
+    if pattern == "1-1":
+        if history[-1] == 1:
+            score_xiu += 2
+        else:
+            score_tai += 2
 
-    # ===== PATTERN =====
-    pattern = {"Tài":0, "Xỉu":0}
-    if len(labels) >= 6:
-        seq = labels[-6:]
+    if pattern == "2-2":
+        score_tai += 1
+        score_xiu += 1
 
-        # xen kẽ
-        if seq[0] != seq[1] and seq[0] == seq[2]:
-            pattern[labels[-2]] += 2
+    # chu kỳ
+    if "lặp" in cycle:
+        if history[-1] == 1:
+            score_tai += 1
+        else:
+            score_xiu += 1
 
-        # 2-2
-        if seq[0] == seq[1] and seq[2] == seq[3]:
-            pattern[seq[0]] += 1
+    # AI
+    if ai is not None:
+        if ai == 1:
+            score_tai += 3
+        else:
+            score_xiu += 3
 
-    # ===== SCORE =====
-    score = {"Tài":0, "Xỉu":0}
+    total = score_tai + score_xiu
+    if total == 0:
+        return "Không rõ", 0
 
-    # streak anti-bệt
-    if streak >= 3:
-        other = "Xỉu" if last == "Tài" else "Tài"
-        score[other] += 2
+    if score_tai > score_xiu:
+        return "TÀI", score_tai / total
     else:
-        score[last] += 1
+        return "XỈU", score_xiu / total
 
-    # markov
-    if trans[last]["Tài"] > trans[last]["Xỉu"]:
-        score["Tài"] += 1
-    else:
-        score["Xỉu"] += 1
+# ===== START =====
+@bot.message_handler(commands=['start'])
+def start(msg):
+    if not is_admin(msg):
+        return
 
-    # pattern
-    score["Tài"] += pattern["Tài"]
-    score["Xỉu"] += pattern["Xỉu"]
+    bot.reply_to(msg, "BOT AI PRO READY")
 
-    final = "Tài" if score["Tài"] > score["Xỉu"] else "Xỉu"
+# ===== RESET =====
+@bot.message_handler(commands=['reset'])
+def reset(msg):
+    if not is_admin(msg):
+        return
 
-    return f"""
-📊 PHÂN TÍCH
+    history.clear()
+    bot.reply_to(msg, "Đã reset")
 
-Chuỗi: {last} x{streak}
+# ===== HANDLE =====
+@bot.message_handler(func=lambda m: True)
+def handle(msg):
+    global model
 
-Markov:
-{last} → Tài: {trans[last]['Tài']}
-{last} → Xỉu: {trans[last]['Xỉu']}
+    if not is_admin(msg):
+        return
 
-Pattern:
-Tài: {pattern['Tài']}
-Xỉu: {pattern['Xỉu']}
+    try:
+        num = int(msg.text)
 
-Score:
-Tài: {score['Tài']}
-Xỉu: {score['Xỉu']}
+        if num < 3 or num > 18:
+            bot.reply_to(msg, "Nhập 3-18")
+            return
 
-Kết quả: {final}
+        tx = 1 if num >= 11 else 0
+        history.append(tx)
+
+        # lưu data
+        with open("data.txt", "a") as f:
+            f.write(str(num) + "\n")
+
+        # AUTO TRAIN (tối ưu)
+        with open("data.txt") as f:
+            lines = f.readlines()
+
+        if len(lines) % 200 == 0:
+            model = train_model()
+
+        pattern = detect_pattern()
+        cycle = detect_cycle()
+        ai, prob_ai = predict_ai()
+
+        result, confidence = vote(pattern, cycle, ai)
+
+        bot.reply_to(msg,
+f"""
+KQ: {num}
+
+Cầu: {pattern}
+Chu kỳ: {cycle}
+
+AI: {"TÀI" if ai==1 else "XỈU" if ai==0 else "??"}
+
+=> Dự đoán: {result}
+Tin cậy: {round(confidence*100)}%
 """
+        )
 
-# ================= HANDLER =================
-async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    nums = parse_numbers(update.message.text)
+    except:
+        bot.reply_to(msg, "Sai định dạng")
 
-    if not nums:
-        await update.message.reply_text("Không có số hợp lệ")
-        return
-
-    if len(nums) > 1:
-        save_bulk(chat_id, nums)
-        await update.message.reply_text(f"Đã lưu {len(nums)} kết quả")
-        return
-
-    n = nums[0]
-    save_one(chat_id, n)
-
-    labels = get_recent(chat_id)
-    result = analyze(labels)
-
-    await update.message.reply_text(f"Nhận: {n} ({classify(n)})\n{result}")
-
-# ================= MAIN =================
-def main():
-    init_db()
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+bot.polling()
