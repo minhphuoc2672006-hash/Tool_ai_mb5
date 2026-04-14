@@ -24,11 +24,9 @@ def load_env():
         return
 
     for line in Path(".env").read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        os.environ[k.strip()] = v.strip().strip('"').strip("'")
+        if "=" in line:
+            k, v = line.split("=", 1)
+            os.environ[k.strip()] = v.strip()
 
 
 load_env()
@@ -119,9 +117,7 @@ class Brain:
         x, y = p
         res = [h["result"] for h in self.history]
 
-        seen = 0
-        tai = 0
-        xiu = 0
+        seen = tai = xiu = 0
 
         for i in range(len(res) - (x+y)):
             if matches_pattern(res[i:i+x+y], x, y):
@@ -164,6 +160,50 @@ LOCK = asyncio.Lock()
 
 
 # =========================
+# AUTO RANDOM
+# =========================
+async def auto_random():
+    while True:
+        async with LOCK:
+            for _ in range(10000):
+                brain.add(
+                    random.choice(["TAI", "XIU"]),
+                    random.randint(3, 18)
+                )
+        print("Random +10000")
+        await asyncio.sleep(60)
+
+
+# =========================
+# COMMANDS
+# =========================
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    msg = (
+        "📖 HƯỚNG DẪN\n"
+        "━━━━━━━━━━━━━━\n"
+        "Tài / Xỉu → lưu\n"
+        "Tài 11 → lưu + số\n"
+        "2-1 → xem cầu\n"
+        "Tài 11 cầu 2-1 → phân tích sâu\n"
+        "/status → xem tổng\n"
+        "/reset → xóa dữ liệu\n"
+    )
+    await update.message.reply_text(msg)
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Tổng: {len(brain.history)}")
+
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    brain.reset()
+    await update.message.reply_text("Đã reset")
+
+
+# =========================
 # HANDLER
 # =========================
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -188,26 +228,22 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Tổng: {len(brain.history)}")
-
-
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    brain.reset()
-    await update.message.reply_text("Đã reset")
-
-
 # =========================
 # MAIN
 # =========================
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+async def post_init(app):
+    app.create_task(auto_random())
 
+
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.TEXT, handle))
 
-    print("Running...")
+    print("Bot chạy + auto random...")
     app.run_polling()
 
 
