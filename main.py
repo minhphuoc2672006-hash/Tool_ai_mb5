@@ -3,15 +3,23 @@
 
 import os
 import re
+import time
 import pickle
-from collections import defaultdict
+from typing import Dict, List, Tuple, Optional
 
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ================= ENV =================
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID") or "0")
+TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+
+def env_int(name: str, default: int = 0) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+ADMIN_ID = env_int("ADMIN_ID", 0)
 
 if not TOKEN:
     raise Exception("Thiếu BOT_TOKEN")
@@ -22,32 +30,39 @@ bot = telebot.TeleBot(TOKEN)
 DATA_FILE = "data.txt"
 STATE_FILE = "state.pkl"
 
-MAX_HISTORY = 500
-WINDOW_SIZES = [4, 5, 6, 7, 8]
-MIN_CLUSTER_SIM = 0.75
-MAX_CLUSTER_SAMPLES = 80
+MAX_HISTORY = 800
+WINDOW_SIZES = [4, 5, 6, 7, 8, 9, 10, 11, 12]
+MIN_CLUSTER_SIM = 0.72
+MAX_CLUSTER_SAMPLES = 120
 MIN_CLUSTER_COUNT_TO_SHOW = 2
 
 # ================= MEMORY =================
-raw_numbers = []
-tx_stream = []
-valid_tx = []
-streaks = []
+raw_numbers: List[int] = []
+tx_stream: List[Optional[int]] = []
+valid_tx: List[int] = []
+streaks: List[int] = []
 
 state = {
-    "markov": {},
-    "clusters": {},
+    "markov": {},   # { (a,b,c): [x_count, t_count] }
+    "clusters": {}, # { win_size: {cluster_id: {...}} }
 }
 
-# ================= HELPERS =================
-def is_admin(msg):
-    if ADMIN_ID == 0:
-        return True
+# ================= PERMISSION =================
+def is_admin_user_id(user_id: int) -> bool:
+    return ADMIN_ID != 0 and user_id == ADMIN_ID
+
+def is_admin_message(msg) -> bool:
     if not getattr(msg, "from_user", None):
         return False
-    return msg.from_user.id == ADMIN_ID
+    return is_admin_user_id(msg.from_user.id)
 
-def parse_input(text):
+def is_admin_callback(call) -> bool:
+    if not getattr(call, "from_user", None):
+        return False
+    return is_admin_user_id(call.from_user.id)
+
+# ================= INPUT / CONVERT =================
+def parse_input(text: str) -> List[int]:
     if not text:
         return []
     nums = re.findall(r"-?\d+", text)
@@ -55,11 +70,12 @@ def parse_input(text):
     for n in nums:
         try:
             out.append(int(n))
-        except ValueError:
+        except Exception:
             continue
     return out
 
-def to_tx(num):
+def to_tx(num: int) -> Optional[int]:
+    # 11-17 = Tài, 4-10 = Xỉu, 3/18 = bão
     if num in (3, 18):
         return None
     if 11 <= num <= 17:
@@ -68,18 +84,18 @@ def to_tx(num):
         return 0
     return None
 
-def tx_name(v):
+def tx_name(v: Optional[int]) -> str:
     if v == 1:
         return "TÀI"
     if v == 0:
         return "XỈU"
     return "BÃO"
 
-def safe_percent(x):
+def safe_percent(x: float) -> int:
     return max(0, min(100, int(round(x * 100))))
 
 # ================= STREAKS =================
-def build_streaks(seq):
+def build_streaks(seq: List[Optional[int]]) -> List[int]:
     out = []
     current = None
     count = 0
@@ -108,7 +124,7 @@ def build_streaks(seq):
     return out
 
 # ================= CLUSTER ENGINE =================
-def cluster_similarity(a, b):
+def cluster_similarity(a: Tuple[int, ...], b: Tuple[int, ...]) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0
 
@@ -117,12 +133,12 @@ def cluster_similarity(a, b):
         if x == y:
             score += 1.0
         elif abs(x - y) <= 1:
-            score += 0.75
+            score += 0.80
         elif abs(x - y) == 2:
-            score += 0.5
+            score += 0.55
     return score / len(a)
 
-def compute_prototype(samples):
+def compute_prototype(samples: List[Tuple[int, ...]]) -> Tuple[int, ...]:
     if not samples:
         return ()
     if len(samples) == 1:
@@ -134,7 +150,7 @@ def compute_prototype(samples):
         proto.append(int(round(sum(col) / len(col))))
     return tuple(proto)
 
-def cluster_kind(proto):
+def cluster_kind(proto: Tuple[int, ...]) -> str:
     if not proto:
         return "CHƯA_RÕ"
 
@@ -161,7 +177,7 @@ def cluster_kind(proto):
 
     return "HỖN_HỢP"
 
-def merge_sample_into_clusters(clusters, sample, seen_at):
+def merge_sample_into_clusters(clusters: Dict[str, dict], sample: Tuple[int, ...], seen_at: int):
     if not sample:
         return
 
@@ -195,7 +211,7 @@ def merge_sample_into_clusters(clusters, sample, seen_at):
         "last_seen": seen_at,
     }
 
-def build_clusters_from_streaks(streak_list):
+def build_clusters_from_streaks(streak_list: List[int]) -> Dict[int, Dict[str, dict]]:
     clusters_by_window = {}
 
     for win in WINDOW_SIZES:
@@ -209,17 +225,17 @@ def build_clusters_from_streaks(streak_list):
     return clusters_by_window
 
 # ================= PERSISTENCE =================
-def save_data_append(nums):
+def save_data_append(nums: List[int]):
     with open(DATA_FILE, "a", encoding="utf-8") as f:
         for n in nums:
             f.write(f"{n}\n")
 
 def save_state():
+    # Lưu raw_numbers để load lại nhanh và an toàn
     with open(STATE_FILE, "wb") as f:
         pickle.dump(
             {
                 "raw_numbers": raw_numbers,
-                "state": state,
             },
             f,
         )
@@ -232,11 +248,11 @@ def load_state_file():
             obj = pickle.load(f)
         if isinstance(obj, dict):
             return obj
-    except:
+    except Exception:
         pass
     return None
 
-def load_history_from_file():
+def load_history_from_file() -> List[int]:
     nums = []
     if not os.path.exists(DATA_FILE):
         return nums
@@ -246,7 +262,7 @@ def load_history_from_file():
                 for n in parse_input(line):
                     if 3 <= n <= 18:
                         nums.append(n)
-    except:
+    except Exception:
         pass
     return nums
 
@@ -258,15 +274,17 @@ def rebuild_all():
     valid_tx = [v for v in tx_stream if v is not None]
     streaks = build_streaks(tx_stream)
 
+    # Markov 3-bước
     markov = {}
     if len(valid_tx) >= 4:
         for i in range(len(valid_tx) - 3):
             key = tuple(valid_tx[i:i + 3])
             nxt = valid_tx[i + 3]
             if key not in markov:
-                markov[key] = [0, 0]
+                markov[key] = [0, 0]  # [X, T]
             markov[key][nxt] += 1
 
+    # Clusters đa cửa sổ
     clusters = build_clusters_from_streaks(streaks)
 
     state = {
@@ -321,6 +339,7 @@ def get_current_cluster():
     if not candidates:
         return None
 
+    # Ưu tiên cụm giống hơn, nếu bằng nhau thì ưu tiên cửa sổ lớn hơn
     return max(candidates, key=lambda x: (x["score"], x["window"]))
 
 def predict_markov():
@@ -459,7 +478,7 @@ def confirm_reset_menu():
 # ================= COMMANDS =================
 @bot.message_handler(commands=["start"])
 def start(msg):
-    if not is_admin(msg):
+    if not is_admin_message(msg):
         return
     bot.send_message(
         msg.chat.id,
@@ -471,13 +490,13 @@ def start(msg):
 
 @bot.message_handler(commands=["menu"])
 def menu(msg):
-    if not is_admin(msg):
+    if not is_admin_message(msg):
         return
     bot.send_message(msg.chat.id, "Chọn chức năng bên dưới:", reply_markup=main_menu())
 
 @bot.message_handler(commands=["help"])
 def help_cmd(msg):
-    if not is_admin(msg):
+    if not is_admin_message(msg):
         return
     bot.send_message(
         msg.chat.id,
@@ -493,7 +512,7 @@ def help_cmd(msg):
 
 @bot.message_handler(commands=["stats"])
 def stats(msg):
-    if not is_admin(msg):
+    if not is_admin_message(msg):
         return
     cluster_count = sum(len(v) for v in state.get("clusters", {}).values())
     bot.send_message(
@@ -510,7 +529,7 @@ def stats(msg):
 
 @bot.message_handler(commands=["clusters"])
 def clusters_cmd(msg):
-    if not is_admin(msg):
+    if not is_admin_message(msg):
         return
     text = clusters_summary(max_items=6)
     bot.send_message(
@@ -522,29 +541,30 @@ def clusters_cmd(msg):
 
 @bot.message_handler(commands=["train"])
 def train_cmd(msg):
-    if not is_admin(msg):
+    if not is_admin_message(msg):
         return
     rebuild_all()
     save_state()
+    cluster_count = sum(len(v) for v in state.get("clusters", {}).values())
     bot.send_message(
         msg.chat.id,
         f"✅ Train xong.\n"
         f"• Tổng phiên: {len(raw_numbers)}\n"
-        f"• Số cụm: {sum(len(v) for v in state.get('clusters', {}).values())}",
+        f"• Số cụm: {cluster_count}",
         reply_markup=main_menu()
     )
 
 @bot.message_handler(commands=["reset"])
 def reset_cmd(msg):
-    if not is_admin(msg):
+    if not is_admin_message(msg):
         return
     bot.send_message(msg.chat.id, "Bạn có chắc muốn xóa toàn bộ dữ liệu?", reply_markup=confirm_reset_menu())
 
 # ================= CALLBACKS =================
 @bot.callback_query_handler(func=lambda call: True)
 def on_callback(call):
-    if not is_admin(call.message):
-        bot.answer_callback_query(call.id, "Không có quyền")
+    if not is_admin_callback(call):
+        bot.answer_callback_query(call.id, "Không có quyền", show_alert=True)
         return
 
     data = call.data
@@ -588,10 +608,11 @@ def on_callback(call):
         elif data == "menu_train":
             rebuild_all()
             save_state()
+            cluster_count = sum(len(v) for v in state.get("clusters", {}).values())
             bot.edit_message_text(
                 f"✅ Train xong.\n"
                 f"• Tổng phiên: {len(raw_numbers)}\n"
-                f"• Số cụm: {sum(len(v) for v in state.get('clusters', {}).values())}",
+                f"• Số cụm: {cluster_count}",
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 reply_markup=main_menu()
@@ -616,13 +637,13 @@ def on_callback(call):
             try:
                 if os.path.exists(DATA_FILE):
                     os.remove(DATA_FILE)
-            except:
+            except Exception:
                 pass
 
             try:
                 if os.path.exists(STATE_FILE):
                     os.remove(STATE_FILE)
-            except:
+            except Exception:
                 pass
 
             bot.edit_message_text(
@@ -656,13 +677,13 @@ def on_callback(call):
 
         bot.answer_callback_query(call.id)
 
-    except:
+    except Exception:
         bot.answer_callback_query(call.id, "Đã có lỗi nhỏ, thử lại.")
 
 # ================= INPUT HANDLER =================
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def handle_text(msg):
-    if not is_admin(msg):
+    if not is_admin_message(msg):
         return
 
     text = msg.text or ""
@@ -728,24 +749,32 @@ def bootstrap():
     global raw_numbers
 
     saved = load_state_file()
-    if saved and "raw_numbers" in saved and isinstance(saved["raw_numbers"], list):
+    if saved and isinstance(saved.get("raw_numbers"), list):
         raw_numbers = [n for n in saved["raw_numbers"] if isinstance(n, int) and 3 <= n <= 18]
     else:
         raw_numbers = load_history_from_file()
 
     rebuild_all()
 
-    if saved and isinstance(saved.get("state"), dict):
-        st = saved["state"]
-        if isinstance(st.get("markov"), dict):
-            state["markov"] = st["markov"]
-        if isinstance(st.get("clusters"), dict):
-            state["clusters"] = st["clusters"]
-
-    if not state.get("clusters"):
-        rebuild_all()
-
 bootstrap()
 
 # ================= RUN =================
-bot.infinity_polling(skip_pending=True)
+def run_bot():
+    # Nếu trước đó từng bật webhook, tắt đi để tránh đụng polling.
+    try:
+        bot.delete_webhook()
+    except Exception:
+        try:
+            bot.remove_webhook()
+        except Exception:
+            pass
+
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
+        except Exception as e:
+            print("BOT ERROR:", e)
+            time.sleep(5)
+
+if __name__ == "__main__":
+    run_bot()
