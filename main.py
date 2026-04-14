@@ -20,25 +20,26 @@ bot = telebot.TeleBot(TOKEN)
 
 # ================= FILES / LIMITS =================
 DATA_FILE = "data.txt"
-MODEL_FILE = "model.pkl"
+STATE_FILE = "state.pkl"
 
-MAX_HISTORY = 400
-WINDOW_SIZES = [4, 5, 6, 7]     # bắt cụm ngắn + dài
+MAX_HISTORY = 500
+WINDOW_SIZES = [4, 5, 6, 7, 8]
 MIN_CLUSTER_SIM = 0.75
-MAX_CLUSTER_SAMPLES = 60
+MAX_CLUSTER_SAMPLES = 80
+MIN_CLUSTER_COUNT_TO_SHOW = 2
 
 # ================= MEMORY =================
-raw_numbers = []    # số gốc 3..18
-tx_stream = []      # 1 = Tài, 0 = Xỉu, None = bão
-valid_tx = []       # chỉ T/X
-streaks = []        # độ dài các streak liên tiếp
+raw_numbers = []
+tx_stream = []
+valid_tx = []
+streaks = []
 
 state = {
-    "markov": {},   # { (a,b,c): [x_count, t_count] }
-    "clusters": {}  # { win_size: {cluster_id: {...}} }
+    "markov": {},
+    "clusters": {},
 }
 
-# ================= BASIC UTILS =================
+# ================= HELPERS =================
 def is_admin(msg):
     if ADMIN_ID == 0:
         return True
@@ -55,7 +56,7 @@ def parse_input(text):
         try:
             out.append(int(n))
         except ValueError:
-            pass
+            continue
     return out
 
 def to_tx(num):
@@ -74,7 +75,10 @@ def tx_name(v):
         return "XỈU"
     return "BÃO"
 
-# ================= HISTORY / STREAKS =================
+def safe_percent(x):
+    return max(0, min(100, int(round(x * 100))))
+
+# ================= STREAKS =================
 def build_streaks(seq):
     out = []
     current = None
@@ -114,6 +118,8 @@ def cluster_similarity(a, b):
             score += 1.0
         elif abs(x - y) <= 1:
             score += 0.75
+        elif abs(x - y) == 2:
+            score += 0.5
     return score / len(a)
 
 def compute_prototype(samples):
@@ -172,7 +178,7 @@ def merge_sample_into_clusters(clusters, sample, seen_at):
         info = clusters[best_key]
         info["count"] += 1
         info["last_seen"] = seen_at
-        info["samples"].append(sample)
+        info["samples"].append(tuple(sample))
         if len(info["samples"]) > MAX_CLUSTER_SAMPLES:
             info["samples"] = info["samples"][-MAX_CLUSTER_SAMPLES:]
         info["prototype"] = compute_prototype(info["samples"])
@@ -209,23 +215,26 @@ def save_data_append(nums):
             f.write(f"{n}\n")
 
 def save_state():
-    with open(MODEL_FILE, "wb") as f:
-        pickle.dump(state, f)
+    with open(STATE_FILE, "wb") as f:
+        pickle.dump(
+            {
+                "raw_numbers": raw_numbers,
+                "state": state,
+            },
+            f,
+        )
 
-def load_state():
-    if not os.path.exists(MODEL_FILE):
-        return {"markov": {}, "clusters": {}}
+def load_state_file():
+    if not os.path.exists(STATE_FILE):
+        return None
     try:
-        with open(MODEL_FILE, "rb") as f:
+        with open(STATE_FILE, "rb") as f:
             obj = pickle.load(f)
-        if not isinstance(obj, dict):
-            return {"markov": {}, "clusters": {}}
-        return {
-            "markov": obj.get("markov", {}),
-            "clusters": obj.get("clusters", {}),
-        }
+        if isinstance(obj, dict):
+            return obj
     except:
-        return {"markov": {}, "clusters": {}}
+        pass
+    return None
 
 def load_history_from_file():
     nums = []
@@ -255,14 +264,14 @@ def rebuild_all():
             key = tuple(valid_tx[i:i + 3])
             nxt = valid_tx[i + 3]
             if key not in markov:
-                markov[key] = [0, 0]  # [X, T]
+                markov[key] = [0, 0]
             markov[key][nxt] += 1
 
     clusters = build_clusters_from_streaks(streaks)
 
     state = {
         "markov": markov,
-        "clusters": clusters
+        "clusters": clusters,
     }
 
 # ================= ANALYSIS =================
@@ -270,7 +279,8 @@ def get_current_cluster():
     if len(streaks) < min(WINDOW_SIZES):
         return None
 
-    result = []
+    candidates = []
+
     for win in WINDOW_SIZES:
         if len(streaks) < win:
             continue
@@ -288,7 +298,7 @@ def get_current_cluster():
 
         if best_key is not None:
             info = clusters[best_key]
-            result.append({
+            candidates.append({
                 "window": win,
                 "id": best_key,
                 "sample": sample,
@@ -298,7 +308,7 @@ def get_current_cluster():
                 "count": info["count"],
             })
         else:
-            result.append({
+            candidates.append({
                 "window": win,
                 "id": "NEW",
                 "sample": sample,
@@ -308,10 +318,10 @@ def get_current_cluster():
                 "count": 0,
             })
 
-    if not result:
+    if not candidates:
         return None
 
-    return max(result, key=lambda x: (x["score"], x["window"]))
+    return max(candidates, key=lambda x: (x["score"], x["window"]))
 
 def predict_markov():
     if len(valid_tx) < 3:
@@ -335,76 +345,95 @@ def predict_markov():
 
     return (1, p_t) if p_t > p_x else (0, p_x)
 
-def decide_result():
+def analyze_status():
     if not valid_tx:
-        return "Không rõ", 0.5
+        return "Chưa đủ dữ liệu", 0.0
 
-    last = valid_tx[-1]
     cluster = get_current_cluster()
     ai_pred, ai_conf = predict_markov()
 
-    score_t = 0.0
-    score_x = 0.0
-
+    score = 0.0
     if cluster:
-        kind = cluster["kind"]
-        sim = cluster["score"]
-        weight = 1.0 if sim >= 0.85 else 0.7 if sim >= 0.75 else 0.4
+        score += cluster["score"] * 0.7
+        if cluster["kind"] in ("BỆT_ĐỀU", "ĐẢO/SHORT-LONG"):
+            score += 0.2
 
-        if kind == "BỆT_ĐỀU":
-            if last == 1:
-                score_t += 1.2 * weight
-            else:
-                score_x += 1.2 * weight
-
-        elif kind == "ĐẢO/SHORT-LONG":
-            if last == 1:
-                score_x += 1.2 * weight
-            else:
-                score_t += 1.2 * weight
-
-        else:
-            score_t += 0.15 * weight
-            score_x += 0.15 * weight
-
-    if ai_pred is not None:
-        if ai_pred == 1:
-            score_t += 1.6 * ai_conf
-        else:
-            score_x += 1.6 * ai_conf
+    score += ai_conf * 0.3
 
     if len(valid_tx) >= 10:
         bias = sum(valid_tx) / len(valid_tx)
-        if bias > 0.65:
-            score_x += 0.4
-        elif bias < 0.35:
-            score_t += 0.4
+        if 0.40 <= bias <= 0.60:
+            score += 0.1
 
-    total = score_t + score_x
-    if total <= 0:
-        return "Không rõ", 0.5
+    score = max(0.0, min(1.0, score))
 
-    p_t = score_t / total
-    if abs(p_t - 0.5) < 0.05:
-        return "Không rõ", 0.5
+    if score < 0.35:
+        return "Nhiễu mạnh", score
+    if score < 0.60:
+        return "Trung bình", score
+    return "Cụm rõ", score
 
-    return ("TÀI", p_t) if p_t > 0.5 else ("XỈU", 1 - p_t)
-
-def clusters_summary(max_items=10):
+def clusters_summary(max_items=6):
     lines = []
     clusters_by_window = state.get("clusters", {})
+
     for win in WINDOW_SIZES:
         clusters = clusters_by_window.get(win, {})
         if not clusters:
             lines.append(f"• Window {win}: chưa có cụm")
             continue
 
-        top = sorted(clusters.items(), key=lambda kv: kv[1]["count"], reverse=True)[:max_items]
+        top = sorted(clusters.items(), key=lambda kv: kv[1]["count"], reverse=True)
+        top = [item for item in top if item[1]["count"] >= MIN_CLUSTER_COUNT_TO_SHOW][:max_items]
+
         lines.append(f"• Window {win}: {len(clusters)} cụm")
+        if not top:
+            lines.append("  - Chưa có cụm đủ mạnh để hiển thị")
+            continue
+
         for cid, info in top:
             proto = "-".join(map(str, info["prototype"]))
             lines.append(f"  - {cid} | {info['kind']} | n={info['count']} | {proto}")
+
     return "\n".join(lines)
+
+def dashboard_text():
+    cluster = get_current_cluster()
+    status, score = analyze_status()
+    ai_pred, ai_conf = predict_markov()
+
+    ai_text = "??"
+    if ai_pred == 1:
+        ai_text = "TÀI"
+    elif ai_pred == 0:
+        ai_text = "XỈU"
+
+    cluster_text = "Chưa đủ dữ liệu để nhận cụm."
+    if cluster:
+        cluster_text = (
+            f"Window: <b>{cluster['window']}</b>\n"
+            f"Mã cụm: <b>{cluster['id']}</b>\n"
+            f"Loại: <b>{cluster['kind']}</b>\n"
+            f"Mẫu hiện tại: <b>{cluster['sample']}</b>\n"
+            f"Đại diện: <b>{cluster['prototype']}</b>\n"
+            f"Khớp: <b>{safe_percent(cluster['score'])}%</b>\n"
+            f"Số lần gặp: <b>{cluster['count']}</b>"
+        )
+
+    last_num = raw_numbers[-1] if raw_numbers else None
+    last_tx = tx_name(tx_stream[-1]) if tx_stream else "N/A"
+
+    return (
+        f"🤖 <b>AI Pattern Tool</b>\n\n"
+        f"📌 Số cuối: <b>{last_num if last_num is not None else 'N/A'}</b> ({last_tx})\n\n"
+        f"🧩 <b>Cụm hiện tại</b>\n{cluster_text}\n\n"
+        f"📍 <b>Trạng thái</b>: <b>{status}</b>\n"
+        f"🔎 Điểm cụm: <b>{safe_percent(score)}%</b>\n"
+        f"🧠 AI Markov: <b>{ai_text}</b> ({safe_percent(ai_conf)}%)\n\n"
+        f"📚 Tổng phiên: <b>{len(raw_numbers)}</b>\n"
+        f"🎯 T/X hợp lệ: <b>{len(valid_tx)}</b>\n"
+        f"🧱 Streak gần nhất: <b>{streaks[-8:] if streaks else []}</b>"
+    )
 
 # ================= UI =================
 def main_menu():
@@ -427,44 +456,6 @@ def confirm_reset_menu():
     )
     return kb
 
-def format_dashboard():
-    cluster = get_current_cluster()
-    result, conf = decide_result()
-    ai_pred, ai_conf = predict_markov()
-
-    ai_text = "??"
-    if ai_pred == 1:
-        ai_text = "TÀI"
-    elif ai_pred == 0:
-        ai_text = "XỈU"
-
-    cluster_text = "Chưa đủ dữ liệu để nhận cụm."
-    if cluster:
-        cluster_text = (
-            f"Window: {cluster['window']}\n"
-            f"Mã cụm: {cluster['id']}\n"
-            f"Loại: {cluster['kind']}\n"
-            f"Mẫu hiện tại: {cluster['sample']}\n"
-            f"Đại diện: {cluster['prototype']}\n"
-            f"Khớp: {round(cluster['score'] * 100)}%\n"
-            f"Số lần gặp: {cluster['count']}"
-        )
-
-    last_num = raw_numbers[-1] if raw_numbers else None
-    last_tx = tx_name(tx_stream[-1]) if tx_stream else "N/A"
-
-    return (
-        f"🤖 <b>AI Pattern Tool</b>\n\n"
-        f"📌 Số cuối: <b>{last_num if last_num is not None else 'N/A'}</b> ({last_tx})\n\n"
-        f"🧩 <b>Cụm hiện tại</b>\n{cluster_text}\n\n"
-        f"🧠 <b>Gợi ý tham khảo</b>: <b>{result}</b>\n"
-        f"📈 Tin cậy: <b>{round(conf * 100)}%</b>\n"
-        f"🔎 AI Markov: <b>{ai_text}</b> ({round(ai_conf * 100)}%)\n\n"
-        f"📚 Tổng số phiên: <b>{len(raw_numbers)}</b>\n"
-        f"🎯 Số T/X hợp lệ: <b>{len(valid_tx)}</b>\n"
-        f"🧱 Streak hiện tại: <b>{streaks[-min(len(streaks), max(WINDOW_SIZES)):] if streaks else []}</b>"
-    )
-
 # ================= COMMANDS =================
 @bot.message_handler(commands=["start"])
 def start(msg):
@@ -472,7 +463,9 @@ def start(msg):
         return
     bot.send_message(
         msg.chat.id,
-        "BOT AI PRO đã sẵn sàng.\nNhập chuỗi số như: 11-10-13-8-12-6\nBot sẽ tự lưu, tự chia cụm ngắn/dài, và hiển thị giao diện nút bấm.",
+        "BOT AI PRO đã sẵn sàng.\n"
+        "Nhập dữ liệu thật theo dạng: 11-10-13-8-12-6\n"
+        "Bot sẽ tự lưu, tự chia cụm ngắn/dài, và hiển thị dashboard.",
         reply_markup=main_menu()
     )
 
@@ -494,7 +487,7 @@ def help_cmd(msg):
         "• /clusters xem các cụm\n"
         "• /train rebuild model\n"
         "• /reset xóa toàn bộ dữ liệu\n\n"
-        "Lưu ý: số 3 và 18 được xem là bão, bot vẫn nhận nhưng sẽ tách khỏi T/X.",
+        "Số 3 và 18 sẽ được tách riêng như bão.",
         reply_markup=main_menu()
     )
 
@@ -510,7 +503,7 @@ def stats(msg):
         f"• T/X hợp lệ: <b>{len(valid_tx)}</b>\n"
         f"• Số cụm đang giữ: <b>{cluster_count}</b>\n"
         f"• Window cụm: <b>{WINDOW_SIZES}</b>\n"
-        f"• Streak hiện tại: <b>{streaks[-10:] if streaks else []}</b>",
+        f"• Streak gần nhất: <b>{streaks[-10:] if streaks else []}</b>",
         reply_markup=main_menu(),
         parse_mode="HTML"
     )
@@ -559,7 +552,7 @@ def on_callback(call):
     try:
         if data == "menu_input":
             bot.edit_message_text(
-                "➕ Nhập kết quả thật vào chat theo dạng:\n"
+                "➕ Nhập dữ liệu thật vào chat theo dạng:\n"
                 "11-10-13-8-12-6\n\n"
                 "Bot sẽ tự học cụm ngắn và dài.",
                 chat_id=call.message.chat.id,
@@ -575,7 +568,7 @@ def on_callback(call):
                 f"• T/X hợp lệ: <b>{len(valid_tx)}</b>\n"
                 f"• Số cụm đang giữ: <b>{cluster_count}</b>\n"
                 f"• Window cụm: <b>{WINDOW_SIZES}</b>\n"
-                f"• Streak hiện tại: <b>{streaks[-10:] if streaks else []}</b>",
+                f"• Streak gần nhất: <b>{streaks[-10:] if streaks else []}</b>",
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 reply_markup=main_menu(),
@@ -595,7 +588,6 @@ def on_callback(call):
         elif data == "menu_train":
             rebuild_all()
             save_state()
-            bot.answer_callback_query(call.id, "Train xong")
             bot.edit_message_text(
                 f"✅ Train xong.\n"
                 f"• Tổng phiên: {len(raw_numbers)}\n"
@@ -628,8 +620,8 @@ def on_callback(call):
                 pass
 
             try:
-                if os.path.exists(MODEL_FILE):
-                    os.remove(MODEL_FILE)
+                if os.path.exists(STATE_FILE):
+                    os.remove(STATE_FILE)
             except:
                 pass
 
@@ -664,9 +656,8 @@ def on_callback(call):
 
         bot.answer_callback_query(call.id)
 
-    except Exception:
+    except:
         bot.answer_callback_query(call.id, "Đã có lỗi nhỏ, thử lại.")
-        return
 
 # ================= INPUT HANDLER =================
 @bot.message_handler(func=lambda m: True, content_types=["text"])
@@ -694,7 +685,7 @@ def handle_text(msg):
     save_state()
 
     cluster = get_current_cluster()
-    result, conf = decide_result()
+    status, score = analyze_status()
     ai_pred, ai_conf = predict_markov()
 
     ai_text = "??"
@@ -705,13 +696,13 @@ def handle_text(msg):
 
     if cluster:
         cluster_text = (
-            f"Window: {cluster['window']}\n"
-            f"Mã cụm: {cluster['id']}\n"
-            f"Loại: {cluster['kind']}\n"
-            f"Mẫu hiện tại: {cluster['sample']}\n"
-            f"Đại diện: {cluster['prototype']}\n"
-            f"Khớp: {round(cluster['score'] * 100)}%\n"
-            f"Số lần gặp: {cluster['count']}"
+            f"Window: <b>{cluster['window']}</b>\n"
+            f"Mã cụm: <b>{cluster['id']}</b>\n"
+            f"Loại: <b>{cluster['kind']}</b>\n"
+            f"Mẫu hiện tại: <b>{cluster['sample']}</b>\n"
+            f"Đại diện: <b>{cluster['prototype']}</b>\n"
+            f"Khớp: <b>{safe_percent(cluster['score'])}%</b>\n"
+            f"Số lần gặp: <b>{cluster['count']}</b>"
         )
     else:
         cluster_text = "Chưa đủ dữ liệu để nhận cụm."
@@ -723,9 +714,9 @@ def handle_text(msg):
         msg.chat.id,
         f"✅ Đã nhận: <b>{last_num}</b> ({last_tx})\n\n"
         f"🧩 <b>Cụm hiện tại</b>\n{cluster_text}\n\n"
-        f"🧠 <b>Gợi ý tham khảo</b>: <b>{result}</b>\n"
-        f"📈 Tin cậy: <b>{round(conf * 100)}%</b>\n"
-        f"🔎 AI Markov: <b>{ai_text}</b> ({round(ai_conf * 100)}%)\n\n"
+        f"📍 <b>Trạng thái</b>: <b>{status}</b>\n"
+        f"🔎 Điểm cụm: <b>{safe_percent(score)}%</b>\n"
+        f"🧠 AI Markov: <b>{ai_text}</b> ({safe_percent(ai_conf)}%)\n\n"
         f"📚 Tổng phiên: <b>{len(raw_numbers)}</b>\n"
         f"🎯 T/X hợp lệ: <b>{len(valid_tx)}</b>",
         reply_markup=main_menu(),
@@ -735,15 +726,24 @@ def handle_text(msg):
 # ================= BOOTSTRAP =================
 def bootstrap():
     global raw_numbers
-    raw_numbers = load_history_from_file()
+
+    saved = load_state_file()
+    if saved and "raw_numbers" in saved and isinstance(saved["raw_numbers"], list):
+        raw_numbers = [n for n in saved["raw_numbers"] if isinstance(n, int) and 3 <= n <= 18]
+    else:
+        raw_numbers = load_history_from_file()
+
     rebuild_all()
 
-    saved = load_state()
-    if isinstance(saved, dict):
-        if saved.get("markov"):
-            state["markov"] = saved["markov"]
-        if saved.get("clusters"):
-            state["clusters"] = saved["clusters"]
+    if saved and isinstance(saved.get("state"), dict):
+        st = saved["state"]
+        if isinstance(st.get("markov"), dict):
+            state["markov"] = st["markov"]
+        if isinstance(st.get("clusters"), dict):
+            state["clusters"] = st["clusters"]
+
+    if not state.get("clusters"):
+        rebuild_all()
 
 bootstrap()
 
