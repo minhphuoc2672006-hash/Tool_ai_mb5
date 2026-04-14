@@ -3,16 +3,17 @@
 
 import asyncio
 import html
+import json
 import os
+import random
 import re
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
-
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 # =========================
 # ENV
@@ -21,14 +22,12 @@ def load_env() -> None:
     p = Path(".env")
     if not p.exists():
         return
-
     for line in p.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
         os.environ[k.strip()] = v.strip().strip('"').strip("'")
-
 
 load_env()
 
@@ -45,36 +44,34 @@ if not BOT_TOKEN:
 if not ADMIN_ID:
     raise RuntimeError("Thiếu ADMIN_ID trong file .env")
 
+DATA_FILE = Path("brain_state.json")
 
 # =========================
-# INPUT VALIDATION
+# CONFIG
 # =========================
-HEX_RE = re.compile(r"([0-9a-fA-F]{8,64})")
+WARMUP_SAMPLES = int(os.getenv("WARMUP_SAMPLES", "10000"))
+RANDOM_MODE = os.getenv("RANDOM_MODE", "1").strip().lower() not in {"0", "false", "off", "no"}
+RANDOM_TRIGGER_CONFIDENCE = int(os.getenv("RANDOM_TRIGGER_CONFIDENCE", "58"))
+GAN_DAM_WEIGHT = float(os.getenv("GAN_DAM_WEIGHT", "1.25"))
 
+# =========================
+# HELPERS
+# =========================
+def esc(text: str) -> str:
+    return html.escape(str(text))
 
-def extract_hex(text: str) -> Optional[str]:
-    if not text:
-        return None
-    m = HEX_RE.search(text)
-    if not m:
-        return None
-    return m.group(1).lower()
-
-
-def strip_accents(text: str) -> str:
-    text = unicodedata.normalize("NFD", text)
-    return "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
-
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 def normalize_text(text: str) -> str:
-    return strip_accents(text).upper().strip()
-
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    return text.upper().strip()
 
 def parse_label(text: str) -> Optional[str]:
     t = normalize_text(text)
     t = re.sub(r"\s+", " ", t)
     tokens = re.findall(r"[A-Z0-9]+", t)
-
     if not tokens:
         return None
 
@@ -83,316 +80,345 @@ def parse_label(text: str) -> Optional[str]:
     if tokens in (["B"], ["LABELB"], ["CLASSB"]):
         return "B"
 
-    if len(tokens) <= 3 and tokens[0] in {"KET", "RESULT", "DAPAN", "DAP", "PHANHOI", "KQ"}:
-        if tokens[-1] == "A" and "B" not in tokens:
-            return "A"
-        if tokens[-1] == "B" and "A" not in tokens:
-            return "B"
+    if tokens and tokens[0] in {"TAI", "T"}:
+        return "A"
+    if tokens and tokens[0] in {"XIU", "X"}:
+        return "B"
 
     return None
 
+def parse_pattern(text: str) -> Optional[Tuple[int, int]]:
+    m = re.search(r"(\d+)\s*-\s*(\d+)", text)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
 
-# =========================
-# DISPLAY HELPERS
-# =========================
-def esc(text: str) -> str:
-    return html.escape(str(text))
-
-
-def format_prediction_message(result: str, confidence: int, score: int, h: str) -> str:
-    short_hash = h[:18] + ("..." if len(h) > 18 else "")
-    return (
-        f"🧠 <b>HASH ANALYZER</b>\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"📥 <b>Hash:</b> <code>{esc(short_hash)}</code>\n"
-        f"🎯 <b>Nhãn dự đoán:</b> <b>{esc(result)}</b>\n"
-        f"📊 <b>Độ tin cậy:</b> <b>{confidence}%</b>\n"
-        f"⚡ <b>Score:</b> <b>{score}</b>\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"🔄 Gửi <b>A</b> hoặc <b>B</b> để feedback."
-    )
-
-
-def format_feedback_message(actual: str, final_pred: str, confidence: int, model_correct: int, model_total: int) -> str:
-    return (
-        f"✅ <b>PHẢN HỒI ĐÃ GHI NHẬN</b>\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"🧾 <b>Nhãn thật:</b> <b>{esc(actual)}</b>\n"
-        f"🤖 <b>Bot đã đoán:</b> <b>{esc(final_pred)}</b>\n"
-        f"📊 <b>Độ tin cậy:</b> <b>{confidence}%</b>\n"
-        f"📈 <b>Mô hình đúng:</b> <b>{model_correct}/{model_total}</b>\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"🧠 Bot đã tự cập nhật."
-    )
-
-
-def format_status_message(text: str) -> str:
-    return (
-        f"📡 <b>TRẠNG THÁI BOT</b>\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"<pre>{esc(text)}</pre>"
-    )
-
+def parse_input(text: str) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
+    return parse_label(text), parse_pattern(text)
 
 def format_start_message() -> str:
     return (
-        f"🚀 <b>HASH ANALYZER BOT</b>\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"• Gửi hash hex để phân tích\n"
-        f"• Gửi <b>A</b> hoặc <b>B</b> để feedback\n"
-        f"• /status xem trạng thái\n"
-        f"• /reset để xóa sạch bộ nhớ\n"
+        "🚀 <b>SEQUENCE ANALYZER</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        "• Gửi <b>A</b> hoặc <b>B</b> để nhập kết quả\n"
+        "• Gửi dạng <b>A 11</b> / <b>B 11</b> để gắn nhãn + số\n"
+        "• Gửi <b>2-1</b> để kiểm tra mẫu\n"
+        "• /status xem trạng thái\n"
+        "• /reset để xóa trạng thái\n"
     )
 
+def format_status_message(text: str) -> str:
+    return (
+        "📡 <b>TRẠNG THÁI BOT</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"<pre>{esc(text)}</pre>"
+    )
 
-# =========================
-# HELPERS
-# =========================
-def norm_hex(h: str) -> str:
-    return h.strip().lower()
-
-
-def hex_to_int(h: str) -> int:
-    return int(h, 16) if h else 0
-
-
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-
-def classify_by_mod_value(v: int, m: int, bias: float = 0.5) -> str:
-    return "A" if (v % m) >= (m * bias) else "B"
-
-
-def slice_hex(h: str) -> Tuple[str, str, str]:
-    n = len(h)
-    head = h[:8]
-    tail = h[-8:] if n >= 8 else h
-    mid_start = max(0, (n // 2) - 4)
-    mid_end = min(n, mid_start + 8)
-    mid = h[mid_start:mid_end]
-    return head, mid, tail
-
-
-# =========================
-# MODEL CONFIG
-# =========================
-MODS_MAIN = [5, 7, 11, 13, 17, 19, 23, 29]
-
-BASE_MOD_WEIGHTS: Dict[int, float] = {
-    5: 1.12,
-    7: 1.18,
-    11: 1.28,
-    13: 1.28,
-    17: 1.34,
-    19: 1.38,
-    23: 1.48,
-    29: 1.58,
-}
-
-MODEL_BASE_WEIGHTS: Dict[str, float] = {
-    "full_mod": 1.45,
-    "slice_consensus": 1.22,
-    "xor_mix": 1.25,
-}
-
+def format_result_message(result: str, confidence: int, score: int, mode_tag: str) -> str:
+    return (
+        "🧠 <b>ANALYSIS</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🎯 <b>Kết luận:</b> <b>{esc(result)}</b>\n"
+        f"📊 <b>Độ tin cậy:</b> <b>{confidence}%</b>\n"
+        f"⚡ <b>Score:</b> <b>{score}</b>\n"
+        f"🎲 <b>Mode:</b> <b>{esc(mode_tag)}</b>\n"
+    )
 
 # =========================
 # STATE
 # =========================
 @dataclass
 class PendingCase:
-    hash_text: str
-    model_preds: Dict[str, str]
-    final_pred: str
+    text: str
+    predicted: str
     confidence: int
     score: int
-
+    pattern: Optional[Tuple[int, int]] = None
+    used_random: bool = False
 
 @dataclass
-class AdaptiveBrain:
-    model_skill: Dict[str, float] = field(default_factory=dict)
-    mod_skill: Dict[int, float] = field(default_factory=dict)
+class BrainState:
+    history: List[str] = field(default_factory=list)
     pending_case: Optional[PendingCase] = None
 
     prediction_count: int = 0
     feedback_count: int = 0
-    streak_loss: int = 0
     streak_win: int = 0
-    last_hash: Optional[str] = None
-    last_feedback: Optional[str] = None
+    streak_loss: int = 0
 
-    def __post_init__(self) -> None:
-        self.reset_all()
+    model_score: Dict[str, float] = field(default_factory=lambda: {
+        "streak": 0.0,
+        "flip": 0.0,
+        "momentum": 0.0,
+        "pattern": 0.0,
+    })
 
-    def reset_all(self) -> None:
-        self.model_skill = {k: 0.0 for k in MODEL_BASE_WEIGHTS}
-        self.mod_skill = {k: 0.0 for k in MODS_MAIN}
+    pattern_stats: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    warmup_done: bool = False
+    warmup_samples: int = WARMUP_SAMPLES
+
+    def save(self) -> None:
+        data = {
+            "history": self.history[-2000:],
+            "prediction_count": self.prediction_count,
+            "feedback_count": self.feedback_count,
+            "streak_win": self.streak_win,
+            "streak_loss": self.streak_loss,
+            "model_score": self.model_score,
+            "pattern_stats": self.pattern_stats,
+            "warmup_done": self.warmup_done,
+            "warmup_samples": self.warmup_samples,
+        }
+        DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def load(self) -> None:
+        if not DATA_FILE.exists():
+            return
+        try:
+            data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+        self.history = list(data.get("history", []))
+        self.prediction_count = int(data.get("prediction_count", 0))
+        self.feedback_count = int(data.get("feedback_count", 0))
+        self.streak_win = int(data.get("streak_win", 0))
+        self.streak_loss = int(data.get("streak_loss", 0))
+        self.model_score.update(data.get("model_score", {}))
+        self.pattern_stats.update(data.get("pattern_stats", {}))
+        self.warmup_done = bool(data.get("warmup_done", False))
+        self.warmup_samples = int(data.get("warmup_samples", WARMUP_SAMPLES))
+
+    def reset(self) -> None:
+        self.history = []
         self.pending_case = None
         self.prediction_count = 0
         self.feedback_count = 0
-        self.streak_loss = 0
         self.streak_win = 0
-        self.last_hash = None
-        self.last_feedback = None
+        self.streak_loss = 0
+        self.model_score = {"streak": 0.0, "flip": 0.0, "momentum": 0.0, "pattern": 0.0}
+        self.pattern_stats = {}
+        self.warmup_done = False
+        self.warmup_samples = WARMUP_SAMPLES
+        self.save()
 
-    def model_weight(self, model_name: str) -> float:
-        base = MODEL_BASE_WEIGHTS.get(model_name, 1.0)
-        skill = self.model_skill.get(model_name, 0.0)
-        factor = 1.0 + (skill * 0.02)
-        factor = clamp(factor, 0.96, 1.04)
-        return base * factor
+    def ensure_pattern_key(self, key: str) -> None:
+        if key not in self.pattern_stats:
+            self.pattern_stats[key] = {"win": 0, "lose": 0}
 
-    def mod_weight(self, m: int) -> float:
-        base = BASE_MOD_WEIGHTS.get(m, 1.0)
-        skill = self.mod_skill.get(m, 0.0)
-        factor = 1.0 + (skill * 0.02)
-        factor = clamp(factor, 0.96, 1.04)
-        return base * factor
+    def warmup(self) -> None:
+        if self.warmup_done:
+            return
 
-    def vote_mod(self, v: int, mods: List[int], bias: float = 0.5) -> str:
-        a = 0.0
-        b = 0.0
-        for m in mods:
-            w = self.mod_weight(m)
-            if classify_by_mod_value(v, m, bias) == "A":
-                a += w
-            else:
-                b += w
-        return "A" if a >= b else "B"
+        for _ in range(self.warmup_samples):
+            a = random.choice(["A", "B"])
+            b = random.choice(["A", "B"])
+            c = random.choice(["A", "B"])
+            seq = [a, b, c]
+            self.history.extend(seq)
 
-    def model_01_full_mod(self, h: str) -> str:
-        v = hex_to_int(h)
-        return self.vote_mod(v, MODS_MAIN, bias=0.50)
+            # giả lập chấm mẫu ngắn
+            self._update_pattern_internal("1-1", seq[-1])
 
-    def model_02_slice_consensus(self, h: str) -> str:
-        head, mid, tail = slice_hex(h)
-        votes = [
-            self.vote_mod(int(head or "0", 16), MODS_MAIN, bias=0.50),
-            self.vote_mod(int(mid or "0", 16), MODS_MAIN, bias=0.50),
-            self.vote_mod(int(tail or "0", 16), MODS_MAIN, bias=0.50),
-        ]
-        return "A" if votes.count("A") >= votes.count("B") else "B"
+        self.history = self.history[-2000:]
+        self.warmup_done = True
+        self.save()
 
-    def model_03_xor_mix(self, h: str) -> str:
-        v = hex_to_int(h)
-        mixed = v ^ (v >> 7) ^ (v << 11)
-        return self.vote_mod(mixed, MODS_MAIN, bias=0.50)
+    def _update_pattern_internal(self, pattern: str, actual: str) -> None:
+        self.ensure_pattern_key(pattern)
 
-    def predict(self, h: str) -> Tuple[str, int, int, Dict[str, str]]:
-        h = norm_hex(h)
+        expected = self.predict_by_pattern(pattern)
+        if expected is None:
+            return
 
-        models: List[Tuple[str, Callable[[str], str]]] = [
-            ("full_mod", self.model_01_full_mod),
-            ("slice_consensus", self.model_02_slice_consensus),
-            ("xor_mix", self.model_03_xor_mix),
-        ]
+        if expected == actual:
+            self.pattern_stats[pattern]["win"] += 1
+            self.model_score["pattern"] = clamp(self.model_score["pattern"] + 0.02, -5.0, 5.0)
+        else:
+            self.pattern_stats[pattern]["lose"] += 1
+            self.model_score["pattern"] = clamp(self.model_score["pattern"] - 0.02, -5.0, 5.0)
 
-        a_weight = 0.0
-        b_weight = 0.0
-        preds: Dict[str, str] = {}
+    def score_history_bias(self) -> float:
+        if len(self.history) < 20:
+            return 0.0
+        last = self.history[-20:]
+        a = last.count("A")
+        b = last.count("B")
+        return (a - b) / 20.0
 
-        for name, fn in models:
-            pred = fn(h)
-            preds[name] = pred
-            w = self.model_weight(name)
-            if pred == "A":
-                a_weight += w
-            else:
-                b_weight += w
+    def predict_by_streak(self) -> str:
+        if len(self.history) < 2:
+            return random.choice(["A", "B"])
+        tail = self.history[-3:]
+        if len(tail) >= 2 and tail[-1] == tail[-2]:
+            return "B" if tail[-1] == "A" else "A"
+        return tail[-1]
 
-        total_weight = a_weight + b_weight
-        result = "A" if a_weight >= b_weight else "B"
+    def predict_by_flip(self) -> str:
+        if len(self.history) < 2:
+            return random.choice(["A", "B"])
+        return "B" if self.history[-1] == "A" else "A"
 
-        confidence = int(round((max(a_weight, b_weight) / max(1e-9, total_weight)) * 100))
-        confidence = max(50, min(99, confidence))
-        score = int(round((a_weight - b_weight) * 10))
+    def predict_by_momentum(self) -> str:
+        bias = self.score_history_bias()
+        if bias > 0.05:
+            return "A"
+        if bias < -0.05:
+            return "B"
+        return random.choice(["A", "B"])
 
-        self.prediction_count += 1
-        self.last_hash = h
-        self.pending_case = PendingCase(
-            hash_text=h,
-            model_preds=preds,
-            final_pred=result,
-            confidence=confidence,
-            score=score,
-        )
-        return result, confidence, score, preds
-
-    def learn_from_feedback(self, actual: str) -> Optional[Dict[str, object]]:
-        if self.pending_case is None:
+    def predict_by_pattern(self, pattern: str) -> Optional[str]:
+        try:
+            x, y = map(int, pattern.split("-"))
+        except Exception:
             return None
+        n = x + y
+        if len(self.history) < n:
+            return None
+        seq = self.history[-n:]
 
-        actual = actual.upper().strip()
-        case = self.pending_case
+        # heuristic đơn giản: nếu phần đầu giống nhau và phần cuối đảo, dự đoán đảo tiếp
+        if x == 1 and y == 1:
+            if len(seq) >= 2 and seq[-1] != seq[-2]:
+                return seq[-1]
+            return self.predict_by_momentum()
 
-        model_correct = 0
-        for name, pred in case.model_preds.items():
-            delta = 1.0 if pred == actual else -1.0
-            new_skill = (self.model_skill.get(name, 0.0) * 0.985) + (delta * 0.015)
-            self.model_skill[name] = clamp(new_skill, -1.0, 1.0)
-            if pred == actual:
-                model_correct += 1
+        if x == 2 and y == 1 and len(seq) >= 3:
+            if seq[0] == seq[1] and seq[2] != seq[1]:
+                return seq[2]
+            return self.predict_by_flip()
 
-        v = int(case.hash_text, 16) if case.hash_text else 0
-        for m in MODS_MAIN:
-            pred_m = classify_by_mod_value(v, m, bias=0.50)
-            delta = 1.0 if pred_m == actual else -1.0
-            new_skill = (self.mod_skill.get(m, 0.0) * 0.985) + (delta * 0.015)
-            self.mod_skill[m] = clamp(new_skill, -1.0, 1.0)
+        if x == 3 and y == 1 and len(seq) >= 4:
+            if seq[0] == seq[1] == seq[2] and seq[3] != seq[2]:
+                return seq[3]
+            return self.predict_by_flip()
 
+        return self.predict_by_momentum()
+
+    def random_server_model(self) -> str:
+        # random có bias nhẹ, dùng như fallback
+        return "A" if random.random() < 0.5 else "B"
+
+    def combined_predict(self, pattern: Optional[Tuple[int, int]] = None) -> Tuple[str, int, int, bool, str]:
+        preds = {
+            "streak": self.predict_by_streak(),
+            "flip": self.predict_by_flip(),
+            "momentum": self.predict_by_momentum(),
+        }
+
+        if pattern is not None:
+            ptxt = f"{pattern[0]}-{pattern[1]}"
+            p_pred = self.predict_by_pattern(ptxt)
+            if p_pred is not None:
+                preds["pattern"] = p_pred
+
+        weights = {
+            "streak": 1.2 + self.model_score["streak"],
+            "flip": 1.1 + self.model_score["flip"],
+            "momentum": 1.3 + self.model_score["momentum"],
+            "pattern": 1.4 + self.model_score["pattern"],
+        }
+
+        a_w = 0.0
+        b_w = 0.0
+        for name, pred in preds.items():
+            w = max(0.1, weights.get(name, 1.0))
+            if pred == "A":
+                a_w += w
+            else:
+                b_w += w
+
+        result = "A" if a_w >= b_w else "B"
+        total = a_w + b_w
+        confidence = int(round((max(a_w, b_w) / max(1e-9, total)) * 100))
+        confidence = max(50, min(99, confidence))
+        score = int(round((a_w - b_w) * 10))
+
+        used_random = False
+        mode_tag = "ENSEMBLE"
+
+        if RANDOM_MODE and confidence <= RANDOM_TRIGGER_CONFIDENCE:
+            used_random = True
+            mode_tag = "RANDOM-FALLBACK"
+            result = self.random_server_model()
+            confidence = min(confidence, RANDOM_TRIGGER_CONFIDENCE)
+            score = int(score * 0.5)
+
+        return result, confidence, score, used_random, mode_tag
+
+    def learn_feedback(self, actual: str, predicted: str, used_random: bool, pattern: Optional[Tuple[int, int]] = None) -> None:
+        self.prediction_count += 1
         self.feedback_count += 1
-        self.last_feedback = actual
 
-        if case.final_pred == actual:
+        if pattern is not None:
+            ptxt = f"{pattern[0]}-{pattern[1]}"
+            self.ensure_pattern_key(ptxt)
+            if predicted == actual:
+                self.pattern_stats[ptxt]["win"] += 1
+            else:
+                self.pattern_stats[ptxt]["lose"] += 1
+
+        # cập nhật trọng số chung
+        if predicted == actual:
             self.streak_win += 1
             self.streak_loss = 0
+            self.model_score["streak"] = clamp(self.model_score["streak"] + 0.03, -5.0, 5.0)
+            self.model_score["flip"] = clamp(self.model_score["flip"] + 0.01, -5.0, 5.0)
+            self.model_score["momentum"] = clamp(self.model_score["momentum"] + 0.02, -5.0, 5.0)
         else:
             self.streak_loss += 1
             self.streak_win = 0
+            self.model_score["streak"] = clamp(self.model_score["streak"] - 0.03, -5.0, 5.0)
+            self.model_score["flip"] = clamp(self.model_score["flip"] - 0.01, -5.0, 5.0)
+            self.model_score["momentum"] = clamp(self.model_score["momentum"] - 0.02, -5.0, 5.0)
 
-        self.pending_case = None
+        if used_random:
+            # random chỉ là fallback, không ép nó "thông minh hơn"
+            self.model_score["pattern"] = clamp(self.model_score["pattern"] + (0.005 if predicted == actual else -0.005), -5.0, 5.0)
 
-        return {
-            "actual": actual,
-            "final_pred": case.final_pred,
-            "confidence": case.confidence,
-            "score": case.score,
-            "model_correct": model_correct,
-            "model_total": len(case.model_preds),
-        }
+        self.history.append(actual)
+        self.history = self.history[-5000:]
+        self.save()
 
     def status_text(self) -> str:
-        top_models = sorted(self.model_skill.items(), key=lambda x: x[1], reverse=True)
-        top_mods = sorted(self.mod_skill.items(), key=lambda x: x[1], reverse=True)
+        top_pattern = "N/A"
+        if self.pattern_stats:
+            best = sorted(
+                self.pattern_stats.items(),
+                key=lambda kv: (kv[1]["win"] / max(1, kv[1]["win"] + kv[1]["lose"])),
+                reverse=True,
+            )[0]
+            w = best[1]["win"]
+            l = best[1]["lose"]
+            top_pattern = f"{best[0]} ({w}/{w+l})"
 
-        lines = ["Trạng thái hiện tại:"]
-        lines.append("Mô hình: " + ", ".join(f"{n}({v:+.2f})" for n, v in top_models))
-        lines.append("Mod mạnh nhất: " + ", ".join(f"{m}({v:+.2f})" for m, v in top_mods))
-        lines.append(f"Số dự đoán: {self.prediction_count}")
-        lines.append(f"Số feedback: {self.feedback_count}")
-        lines.append(f"Chuỗi đúng: {self.streak_win}")
-        lines.append(f"Chuỗi sai: {self.streak_loss}")
-
-        if self.pending_case:
-            lines.append(f"Dự đoán gần nhất: {self.pending_case.final_pred} - {self.pending_case.confidence}%")
-
+        lines = [
+            f"Warmup done: {self.warmup_done}",
+            f"Warmup samples: {self.warmup_samples}",
+            f"History size: {len(self.history)}",
+            f"Predictions: {self.prediction_count}",
+            f"Feedback: {self.feedback_count}",
+            f"Streak win: {self.streak_win}",
+            f"Streak loss: {self.streak_loss}",
+            f"Score streak: {self.model_score['streak']:+.2f}",
+            f"Score flip: {self.model_score['flip']:+.2f}",
+            f"Score momentum: {self.model_score['momentum']:+.2f}",
+            f"Score pattern: {self.model_score['pattern']:+.2f}",
+            f"Best pattern: {top_pattern}",
+        ]
         return "\n".join(lines)
 
-
-brain = AdaptiveBrain()
+brain = BrainState()
 LOCK = asyncio.Lock()
 
-
 # =========================
-# TELEGRAM HANDLERS
+# TELEGRAM COMMANDS
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
     if update.message:
         await update.message.reply_text(format_start_message(), parse_mode="HTML")
-
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
@@ -401,40 +427,40 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "📖 <b>HƯỚNG DẪN</b>\n"
             "━━━━━━━━━━━━━━\n"
-            "1) Gửi hash hex\n"
-            "2) Nhận nhãn A/B + %\n"
-            "3) Gửi A hoặc B để bot tự ghi nhận\n"
-            "4) /reset để xóa sạch toàn bộ trạng thái",
+            "• Gửi A/B để thêm kết quả\n"
+            "• Gửi A 11 hoặc B 11 để gắn nhãn có số\n"
+            "• Gửi 2-1, 3-1... để kiểm tra mẫu\n"
+            "• /status xem trạng thái\n"
+            "• /reset xóa toàn bộ dữ liệu",
             parse_mode="HTML",
         )
-
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
-    if update.message:
-        async with LOCK:
-            await update.message.reply_text(
-                format_status_message(brain.status_text()),
-                parse_mode="HTML",
-            )
-
+    async with LOCK:
+        if update.message:
+            await update.message.reply_text(format_status_message(brain.status_text()), parse_mode="HTML")
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
-
     async with LOCK:
-        brain.reset_all()
-
+        brain.reset()
     if update.message:
-        await update.message.reply_text(
-            "📦 <b>Đã reset sạch toàn bộ trạng thái.</b>\n"
-            "Bot đã quay về như mới.",
-            parse_mode="HTML",
-        )
+        await update.message.reply_text("📦 <b>Đã reset sạch.</b>", parse_mode="HTML")
 
+async def warmup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+    async with LOCK:
+        brain.warmup()
+    if update.message:
+        await update.message.reply_text("✅ <b>Đã học xong dữ liệu khởi tạo.</b>", parse_mode="HTML")
 
+# =========================
+# MAIN HANDLER
+# =========================
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
@@ -444,64 +470,96 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     async with LOCK:
-        actual = parse_label(text)
-        if actual and brain.pending_case is not None:
-            info = brain.learn_from_feedback(actual)
-            if info is None:
+        # input dạng: A 11 / B 11 / A / B
+        label, pattern = parse_input(text)
+
+        if label:
+            # Nếu đang có ca dự đoán trước đó, thì dòng này là feedback
+            if brain.pending_case is not None:
+                pc = brain.pending_case
+                brain.learn_feedback(
+                    actual=label,
+                    predicted=pc.predicted,
+                    used_random=pc.used_random,
+                    pattern=pc.pattern,
+                )
+                brain.pending_case = None
                 await update.message.reply_text(
-                    "⚠️ <b>Chưa có ca dự đoán nào để học.</b>",
+                    "✅ <b>Đã ghi nhận kết quả và cập nhật mô hình.</b>",
                     parse_mode="HTML",
                 )
                 return
 
-            await update.message.reply_text(
-                format_feedback_message(
-                    actual=actual,
-                    final_pred=info["final_pred"],
-                    confidence=info["confidence"],
-                    model_correct=info["model_correct"],
-                    model_total=info["model_total"],
-                ),
-                parse_mode="HTML",
-            )
+            # Nếu chưa có pending case, vẫn lưu như lịch sử
+            brain.history.append(label)
+            brain.history = brain.history[-5000:]
+            brain.save()
+
+            if pattern is not None:
+                ptxt = f"{pattern[0]}-{pattern[1]}"
+                pred, conf, score, used_random, mode_tag = brain.combined_predict(pattern)
+                brain.pending_case = PendingCase(
+                    text=text,
+                    predicted=pred,
+                    confidence=conf,
+                    score=score,
+                    pattern=pattern,
+                    used_random=used_random,
+                )
+                await update.message.reply_text(
+                    format_result_message(pred, conf, score, mode_tag) + f"\n🧩 <b>Pattern:</b> <code>{esc(ptxt)}</code>",
+                    parse_mode="HTML",
+                )
+                return
+
+            await update.message.reply_text("✅ <b>Đã lưu kết quả.</b>", parse_mode="HTML")
             return
 
-        h = extract_hex(text)
-        if h:
-            if len(h) < 8:
-                await update.message.reply_text(
-                    "⚠️ <b>Chuỗi hex quá ngắn.</b>",
-                    parse_mode="HTML",
-                )
-                return
-
-            result, confidence, score, _preds = brain.predict(h)
+        # pattern only: 2-1 / 3-1 ...
+        if pattern is not None:
+            pred, conf, score, used_random, mode_tag = brain.combined_predict(pattern)
+            brain.pending_case = PendingCase(
+                text=text,
+                predicted=pred,
+                confidence=conf,
+                score=score,
+                pattern=pattern,
+                used_random=used_random,
+            )
             await update.message.reply_text(
-                format_prediction_message(result, confidence, score, h),
+                format_result_message(pred, conf, score, mode_tag) +
+                f"\n🧩 <b>Pattern:</b> <code>{esc(f'{pattern[0]}-{pattern[1]}')}</code>",
                 parse_mode="HTML",
             )
             return
 
         await update.message.reply_text(
-            "❌ <b>Không thấy hash hex hợp lệ.</b>\n"
-            "Gửi hash hoặc gửi <b>A</b>/<b>B</b> để feedback.",
+            "❌ <b>Không hiểu dữ liệu.</b>\n"
+            "Gửi A/B hoặc 2-1.",
             parse_mode="HTML",
         )
 
-
+# =========================
+# STARTUP
+# =========================
 def main():
+    brain.load()
+    brain.warmup()
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
-    app.add_handler(CommandHandler("hardreset", reset_cmd))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle))
+    app.add_handler(CommandHandler("warmup", warmup_cmd))
+
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle)
+    )
 
     print("Bot đang chạy...")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
