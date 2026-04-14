@@ -3,6 +3,7 @@
 """
 Telegram bot phân tích Tài/Xỉu với:
 - Lưu lịch sử vào SQLite (không giới hạn)
+- Ghi nhanh theo lô
 - Nhận diện cầu sâu: lặp, xen kẽ, chuyển pha, chu kỳ, mẫu động
 - Lọc nhiễu bằng chaos/confidence/consensus
 - Biểu đồ cầu và biểu đồ xí ngầu
@@ -59,7 +60,7 @@ HIGH_LABEL = os.getenv("HIGH_LABEL", "Tài")
 
 RECENT_CACHE = int(os.getenv("RECENT_CACHE", "500"))
 HISTORY_ANALYSIS_LIMIT = int(os.getenv("HISTORY_ANALYSIS_LIMIT", "0"))  # 0 = đọc toàn bộ
-MAX_KEEP_HISTORY = int(os.getenv("MAX_KEEP_HISTORY", "0"))              # 0 = không giới hạn, không xóa
+MAX_KEEP_HISTORY = int(os.getenv("MAX_KEEP_HISTORY", "0"))              # 0 = không xóa
 MAX_INPUT_NUMS = int(os.getenv("MAX_INPUT_NUMS", "1000000"))
 USER_CACHE_LIMIT = int(os.getenv("USER_CACHE_LIMIT", "500"))
 MIN_ANALYSIS_LEN = int(os.getenv("MIN_ANALYSIS_LEN", "6"))
@@ -218,6 +219,9 @@ def db_connect() -> sqlite3.Connection:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
             conn.execute("PRAGMA temp_store=MEMORY;")
+            conn.execute("PRAGMA cache_size=-50000;")
+            conn.execute("PRAGMA mmap_size=134217728;")
+            conn.execute("PRAGMA busy_timeout=30000;")
             conn.execute("PRAGMA foreign_keys=ON;")
             return conn
         except sqlite3.DatabaseError as e:
@@ -261,7 +265,6 @@ def init_db() -> None:
             conn.commit()
 
 def prune_history(conn: sqlite3.Connection, chat_id: int, keep_limit: int) -> None:
-    # Không xóa gì nếu keep_limit <= 0
     if keep_limit <= 0:
         return
     row = conn.execute(
@@ -275,13 +278,18 @@ async def append_history(chat_id: int, items: List[Tuple[int, str]]) -> None:
     if not items:
         return
 
+    BATCH_SIZE = 1000
+
     def _work():
         try:
             with db_connect() as conn:
-                conn.executemany(
-                    "INSERT INTO history (chat_id, raw_value, label) VALUES (?, ?, ?)",
-                    [(chat_id, int(raw_value), str(label)) for raw_value, label in items],
-                )
+                conn.execute("BEGIN IMMEDIATE;")
+                for i in range(0, len(items), BATCH_SIZE):
+                    chunk = items[i:i + BATCH_SIZE]
+                    conn.executemany(
+                        "INSERT INTO history (chat_id, raw_value, label) VALUES (?, ?, ?)",
+                        [(chat_id, int(raw_value), str(label)) for raw_value, label in chunk],
+                    )
                 prune_history(conn, chat_id, MAX_KEEP_HISTORY)
                 conn.commit()
         except Exception as e:
@@ -464,11 +472,6 @@ async def save_state(chat_id: int, state: Dict[str, Any]) -> None:
 
 # ===================== INPUT PARSER =====================
 def parse_input(text: str) -> Tuple[List[int], List[List[int]]]:
-    """
-    - Mặc định: mọi số nguyên người dùng nhập sẽ được lưu nguyên vẹn vào history.
-    - Không tự ghép nhầm 1..6 thành xí ngầu.
-    - Xí ngầu chỉ được nhận khi người dùng nhập rất rõ dạng có dấu phân cách như | ; / hoặc xuống dòng.
-    """
     text = (text or "").strip()
     if not text:
         return [], []
@@ -1252,15 +1255,15 @@ def prediction_gate(labels: List[str], report: Dict[str, Any], state: Optional[D
         return False, f"Chưa đủ {MIN_PREDICTION_DATA} dữ liệu"
 
     if top_score >= 70 and chaos <= 72 and structure_hint != "CẦU LOẠN":
-        return True, f"Bắt nhanh: {top.get('name', '-') } ({top_score}%)"
+        return True, f"Bắt nhanh: {top.get('name', '-')} ({top_score}%)"
 
     if top_score >= 58 and chaos <= 62 and structure_hint != "CẦU LOẠN":
-        return True, f"Có cầu: {top.get('name', '-') } ({top_score}%)"
+        return True, f"Có cầu: {top.get('name', '-')} ({top_score}%)"
 
     if top_score >= 54 and total >= 6 and report.get("repeat_count", 0) >= 1:
-        return True, f"Có nhịp mới: {top.get('name', '-') } ({top_score}%)"
+        return True, f"Có nhịp mới: {top.get('name', '-')} ({top_score}%)"
 
-    return False, f"Cầu còn yếu: {top.get('name', '-') } ({top_score}%)"
+    return False, f"Cầu còn yếu: {top.get('name', '-')} ({top_score}%)"
 
 def predict_pattern(labels: List[str], report: Dict[str, Any]) -> Dict[str, Any]:
     patterns = report.get("patterns", [])
@@ -2064,6 +2067,19 @@ def ensure_robot_animation() -> str:
         return ensure_robot_asset()
     return ROBOT_ANIM_PATH
 
+def overall_winrate(state: Dict[str, Any]) -> float:
+    return safe_div(int(state.get("prediction_hits", 0)) * 100.0, int(state.get("prediction_total", 0)))
+
+def recent_winrate(state: Dict[str, Any], window: int = 20) -> float:
+    outcomes = state.get("recent_outcomes", [])
+    if not isinstance(outcomes, list):
+        return 0.0
+    tail = outcomes[-window:] if len(outcomes) > window else outcomes[:]
+    if not tail:
+        return 0.0
+    wins = sum(1 for x in tail if x == "WIN")
+    return safe_div(wins * 100.0, len(tail))
+
 def build_final_message(meta: Dict[str, Any], state: Dict[str, Any]) -> str:
     return (
         "✅ ROBOT ĐÃ PHÂN TÍCH XONG\n"
@@ -2134,19 +2150,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Quy đổi: số >= {THRESHOLD} -> {HIGH_LABEL}, số < {THRESHOLD} -> {LOW_LABEL}.\n"
         "Luồng hoạt động: cập nhật thống kê → biểu đồ cầu → biểu đồ xí ngầu → robot phân tích → chốt cuối."
     )
-
-def overall_winrate(state: Dict[str, Any]) -> float:
-    return safe_div(int(state.get("prediction_hits", 0)) * 100.0, int(state.get("prediction_total", 0)))
-
-def recent_winrate(state: Dict[str, Any], window: int = 20) -> float:
-    outcomes = state.get("recent_outcomes", [])
-    if not isinstance(outcomes, list):
-        return 0.0
-    tail = outcomes[-window:] if len(outcomes) > window else outcomes[:]
-    if not tail:
-        return 0.0
-    wins = sum(1 for x in tail if x == "WIN")
-    return safe_div(wins * 100.0, len(tail))
 
 def build_trace_message(state: Dict[str, Any]) -> str:
     recent = recent_winrate(state, 20)
@@ -2466,6 +2469,16 @@ async def process_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, nums:
 
         if entries:
             await append_history(chat_id, entries)
+
+            state.setdefault("values", [])
+            state.setdefault("labels", [])
+            for n, label in entries:
+                state["values"].append(n)
+                state["labels"].append(label)
+
+            trim_state_memory(state)
+            rebuild_counters_from_labels(state, state["labels"])
+
             if dice_rolls:
                 valid_rolls = [r for r in dice_rolls if isinstance(r, list) and len(r) == 3]
                 if valid_rolls:
@@ -2473,13 +2486,8 @@ async def process_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, nums:
                     state["dice_rolls"].extend(valid_rolls)
                     state["dice_rolls"] = _safe_tail(state["dice_rolls"], RECENT_CACHE)
 
-        rows = await load_history_rows(chat_id, limit=HISTORY_ANALYSIS_LIMIT)
-        full_values = [r[0] for r in rows]
-        full_labels = [r[1] for r in rows]
-
-        state["values"] = _safe_tail(full_values, RECENT_CACHE)
-        state["labels"] = _safe_tail(full_labels, RECENT_CACHE)
-        rebuild_counters_from_labels(state, full_labels)
+        full_values = list(state.get("values", []))
+        full_labels = list(state.get("labels", []))
 
         if entries:
             latest_actual_value = entries[-1][0]
