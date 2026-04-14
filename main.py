@@ -49,7 +49,7 @@ state = {
 
 # ================= PERMISSION =================
 def is_admin_user_id(user_id: int) -> bool:
-    return ADMIN_ID != 0 and user_id == ADMIN_ID
+    return ADMIN_ID == 0 or user_id == ADMIN_ID
 
 def is_admin_message(msg) -> bool:
     if not getattr(msg, "from_user", None):
@@ -231,7 +231,6 @@ def save_data_append(nums: List[int]):
             f.write(f"{n}\n")
 
 def save_state():
-    # Lưu raw_numbers để load lại nhanh và an toàn
     with open(STATE_FILE, "wb") as f:
         pickle.dump(
             {
@@ -339,7 +338,6 @@ def get_current_cluster():
     if not candidates:
         return None
 
-    # Ưu tiên cụm giống hơn, nếu bằng nhau thì ưu tiên cửa sổ lớn hơn
     return max(candidates, key=lambda x: (x["score"], x["window"]))
 
 def predict_markov():
@@ -369,7 +367,7 @@ def analyze_status():
         return "Chưa đủ dữ liệu", 0.0
 
     cluster = get_current_cluster()
-    ai_pred, ai_conf = predict_markov()
+    _, ai_conf = predict_markov()
 
     score = 0.0
     if cluster:
@@ -391,6 +389,62 @@ def analyze_status():
     if score < 0.60:
         return "Trung bình", score
     return "Cụm rõ", score
+
+def make_prediction():
+    cluster = get_current_cluster()
+    ai_pred, ai_conf = predict_markov()
+
+    score_t = 0.0
+    score_x = 0.0
+
+    if cluster:
+        kind = cluster["kind"]
+        sim = cluster["score"]
+        weight = 1.0 if sim >= 0.88 else 0.75 if sim >= 0.80 else 0.45
+
+        if kind == "BỆT_ĐỀU":
+            if valid_tx and valid_tx[-1] == 1:
+                score_t += 1.0 * weight
+            else:
+                score_x += 1.0 * weight
+
+        elif kind == "ĐẢO/SHORT-LONG":
+            if valid_tx and valid_tx[-1] == 1:
+                score_x += 1.0 * weight
+            else:
+                score_t += 1.0 * weight
+
+        else:
+            score_t += 0.15 * weight
+            score_x += 0.15 * weight
+
+    if ai_pred is not None:
+        if ai_pred == 1:
+            score_t += 1.5 * ai_conf
+        else:
+            score_x += 1.5 * ai_conf
+
+    if len(valid_tx) >= 10:
+        bias = sum(valid_tx) / len(valid_tx)
+        if bias > 0.65:
+            score_x += 0.3
+        elif bias < 0.35:
+            score_t += 0.3
+
+    total = score_t + score_x
+    if total <= 0:
+        return "KHÔNG RÕ", 50.0
+
+    p_t = score_t / total
+    p_x = score_x / total
+    best = max(p_t, p_x)
+
+    if best < 0.58:
+        return "KHÔNG RÕ", round(best * 100, 1)
+
+    if p_t > p_x:
+        return "TÀI", round(p_t * 100, 1)
+    return "XỈU", round(p_x * 100, 1)
 
 def clusters_summary(max_items=6):
     lines = []
@@ -420,6 +474,7 @@ def dashboard_text():
     cluster = get_current_cluster()
     status, score = analyze_status()
     ai_pred, ai_conf = predict_markov()
+    prediction_label, prediction_pct = make_prediction()
 
     ai_text = "??"
     if ai_pred == 1:
@@ -448,7 +503,9 @@ def dashboard_text():
         f"🧩 <b>Cụm hiện tại</b>\n{cluster_text}\n\n"
         f"📍 <b>Trạng thái</b>: <b>{status}</b>\n"
         f"🔎 Điểm cụm: <b>{safe_percent(score)}%</b>\n"
-        f"🧠 AI Markov: <b>{ai_text}</b> ({safe_percent(ai_conf)}%)\n\n"
+        f"🧠 AI Markov: <b>{ai_text}</b> ({safe_percent(ai_conf)}%)\n"
+        f"🎯 <b>Dự đoán:</b> <b>{prediction_label}</b>\n"
+        f"📈 <b>Tỷ lệ:</b> <b>{prediction_pct}%</b>\n\n"
         f"📚 Tổng phiên: <b>{len(raw_numbers)}</b>\n"
         f"🎯 T/X hợp lệ: <b>{len(valid_tx)}</b>\n"
         f"🧱 Streak gần nhất: <b>{streaks[-8:] if streaks else []}</b>"
@@ -458,6 +515,7 @@ def dashboard_text():
 def main_menu():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
+        InlineKeyboardButton("📌 Dashboard", callback_data="menu_panel"),
         InlineKeyboardButton("➕ Nhập dữ liệu", callback_data="menu_input"),
         InlineKeyboardButton("📊 Thống kê", callback_data="menu_stats"),
         InlineKeyboardButton("🧩 Cụm", callback_data="menu_clusters"),
@@ -494,6 +552,17 @@ def menu(msg):
         return
     bot.send_message(msg.chat.id, "Chọn chức năng bên dưới:", reply_markup=main_menu())
 
+@bot.message_handler(commands=["panel"])
+def panel(msg):
+    if not is_admin_message(msg):
+        return
+    bot.send_message(
+        msg.chat.id,
+        dashboard_text(),
+        reply_markup=main_menu(),
+        parse_mode="HTML"
+    )
+
 @bot.message_handler(commands=["help"])
 def help_cmd(msg):
     if not is_admin_message(msg):
@@ -502,6 +571,7 @@ def help_cmd(msg):
         msg.chat.id,
         "Cách dùng:\n"
         "• Nhập dữ liệu thật: 11-10-13-8-12\n"
+        "• /panel xem dashboard\n"
         "• /stats xem thống kê\n"
         "• /clusters xem các cụm\n"
         "• /train rebuild model\n"
@@ -570,7 +640,16 @@ def on_callback(call):
     data = call.data
 
     try:
-        if data == "menu_input":
+        if data == "menu_panel":
+            bot.edit_message_text(
+                dashboard_text(),
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=main_menu(),
+                parse_mode="HTML"
+            )
+
+        elif data == "menu_input":
             bot.edit_message_text(
                 "➕ Nhập dữ liệu thật vào chat theo dạng:\n"
                 "11-10-13-8-12-6\n\n"
@@ -665,6 +744,7 @@ def on_callback(call):
             bot.edit_message_text(
                 "Cách dùng:\n"
                 "• Nhập dữ liệu thật: 11-10-13-8-12\n"
+                "• /panel xem dashboard\n"
                 "• /stats xem thống kê\n"
                 "• /clusters xem các cụm\n"
                 "• /train rebuild model\n"
@@ -708,6 +788,7 @@ def handle_text(msg):
     cluster = get_current_cluster()
     status, score = analyze_status()
     ai_pred, ai_conf = predict_markov()
+    prediction_label, prediction_pct = make_prediction()
 
     ai_text = "??"
     if ai_pred == 1:
@@ -737,7 +818,9 @@ def handle_text(msg):
         f"🧩 <b>Cụm hiện tại</b>\n{cluster_text}\n\n"
         f"📍 <b>Trạng thái</b>: <b>{status}</b>\n"
         f"🔎 Điểm cụm: <b>{safe_percent(score)}%</b>\n"
-        f"🧠 AI Markov: <b>{ai_text}</b> ({safe_percent(ai_conf)}%)\n\n"
+        f"🧠 AI Markov: <b>{ai_text}</b> ({safe_percent(ai_conf)}%)\n"
+        f"🎯 <b>Dự đoán:</b> <b>{prediction_label}</b>\n"
+        f"📈 <b>Tỷ lệ:</b> <b>{prediction_pct}%</b>\n\n"
         f"📚 Tổng phiên: <b>{len(raw_numbers)}</b>\n"
         f"🎯 T/X hợp lệ: <b>{len(valid_tx)}</b>",
         reply_markup=main_menu(),
@@ -760,7 +843,6 @@ bootstrap()
 
 # ================= RUN =================
 def run_bot():
-    # Nếu trước đó từng bật webhook, tắt đi để tránh đụng polling.
     try:
         bot.delete_webhook()
     except Exception:
