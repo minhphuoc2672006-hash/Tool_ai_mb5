@@ -2,30 +2,48 @@ import telebot
 import pickle
 import os
 
-# ===== ENV (ẨN TOKEN) =====
+# ================= ENV =================
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_ID = int(os.getenv("ADMIN_ID") or "0")
+
+if not TOKEN:
+    raise Exception("Thiếu BOT_TOKEN")
 
 bot = telebot.TeleBot(TOKEN)
 
+# ================= DATA =================
 history = []
 
-# ===== LOAD MODEL =====
+# ================= LOAD MODEL =================
 def load_model():
-    global model
     try:
         with open("model.pkl", "rb") as f:
-            model = pickle.load(f)
+            return pickle.load(f)
     except:
-        model = {}
+        return {}
 
-load_model()
+model = load_model()
 
-# ===== CHECK ADMIN =====
+# ================= CHECK ADMIN =================
 def is_admin(msg):
     return msg.from_user.id == ADMIN_ID
 
-# ===== CẦU =====
+# ================= PARSE INPUT =================
+def parse_input(text):
+    # nhận: "14-5-10" hoặc "12"
+    try:
+        if "-" in text:
+            return [int(x) for x in text.split("-") if x.strip().isdigit()]
+        else:
+            return [int(text)]
+    except:
+        return []
+
+# ================= CONVERT =================
+def to_tx(num):
+    return 1 if num >= 11 else 0
+
+# ================= PATTERN =================
 def detect_pattern():
     if len(history) < 4:
         return "Chưa rõ"
@@ -43,24 +61,22 @@ def detect_pattern():
 
     return "Gãy"
 
-# ===== CHU KỲ SÂU =====
+# ================= CYCLE =================
 def detect_cycle():
     if len(history) < 8:
         return "Không rõ"
 
     seq = history[-8:]
 
-    # lặp 4-4
     if seq[:4] == seq[4:]:
         return "Chu kỳ lặp 4"
 
-    # 1-1 dài
     if seq == [1,0,1,0,1,0,1,0] or seq == [0,1,0,1,0,1,0,1]:
         return "Chu kỳ 1-1"
 
     return "Nhiễu"
 
-# ===== AI =====
+# ================= AI =================
 def predict_ai():
     if len(history) < 3:
         return None, 0
@@ -79,101 +95,101 @@ def predict_ai():
 
     return None, 0
 
-# ===== TRAIN =====
+# ================= TRAIN =================
 def train_model():
-    data = []
-
     if not os.path.exists("data.txt"):
         return model
+
+    data = []
 
     with open("data.txt") as f:
         for line in f:
             try:
                 n = int(line.strip())
-                tx = 1 if n >= 11 else 0
-                data.append(tx)
+                data.append(to_tx(n))
             except:
                 continue
 
-    model_new = {}
+    new_model = {}
 
-    for i in range(len(data)-3):
+    for i in range(len(data) - 3):
         key = tuple(data[i:i+3])
         nxt = data[i+3]
 
-        if key not in model_new:
-            model_new[key] = [0, 0]
+        if key not in new_model:
+            new_model[key] = [0, 0]
 
-        model_new[key][nxt] += 1
+        new_model[key][nxt] += 1
 
     with open("model.pkl", "wb") as f:
-        pickle.dump(model_new, f)
+        pickle.dump(new_model, f)
 
-    return model_new
+    return new_model
 
-# ===== VOTE =====
+# ================= VOTE =================
 def vote(pattern, cycle, ai):
-    score_tai = 0
-    score_xiu = 0
+    if not history:
+        return "Không rõ", 0
 
-    # cầu
+    score_t = 0
+    score_x = 0
+
+    last = history[-1]
+
+    # pattern
     if pattern == "Bệt":
-        if history[-1] == 1:
-            score_tai += 2
+        if last == 1:
+            score_t += 2
         else:
-            score_xiu += 2
+            score_x += 2
 
-    if pattern == "1-1":
-        if history[-1] == 1:
-            score_xiu += 2
+    elif pattern == "1-1":
+        if last == 1:
+            score_x += 2
         else:
-            score_tai += 2
+            score_t += 2
 
-    if pattern == "2-2":
-        score_tai += 1
-        score_xiu += 1
+    elif pattern == "2-2":
+        score_t += 1
+        score_x += 1
 
-    # chu kỳ
+    # cycle
     if "lặp" in cycle:
-        if history[-1] == 1:
-            score_tai += 1
+        if last == 1:
+            score_t += 1
         else:
-            score_xiu += 1
+            score_x += 1
 
     # AI
     if ai is not None:
         if ai == 1:
-            score_tai += 3
+            score_t += 3
         else:
-            score_xiu += 3
+            score_x += 3
 
-    total = score_tai + score_xiu
+    total = score_t + score_x
+
     if total == 0:
         return "Không rõ", 0
 
-    if score_tai > score_xiu:
-        return "TÀI", score_tai / total
-    else:
-        return "XỈU", score_xiu / total
+    return ("TÀI", score_t/total) if score_t > score_x else ("XỈU", score_x/total)
 
-# ===== START =====
+# ================= START =================
 @bot.message_handler(commands=['start'])
 def start(msg):
     if not is_admin(msg):
         return
+    bot.reply_to(msg, "BOT AI PRO UPGRADED READY 🚀")
 
-    bot.reply_to(msg, "BOT AI PRO READY")
-
-# ===== RESET =====
+# ================= RESET =================
 @bot.message_handler(commands=['reset'])
 def reset(msg):
     if not is_admin(msg):
         return
-
     history.clear()
-    bot.reply_to(msg, "Đã reset")
+    bot.reply_to(msg, "Đã reset history")
 
-# ===== HANDLE =====
+# ================= HANDLE =================
 @bot.message_handler(func=lambda m: True)
 def handle(msg):
     global model
@@ -181,36 +197,35 @@ def handle(msg):
     if not is_admin(msg):
         return
 
-    try:
-        num = int(msg.text)
+    nums = parse_input(msg.text)
+
+    if not nums:
+        bot.reply_to(msg, "Sai định dạng")
+        return
+
+    for num in nums:
 
         if num < 3 or num > 18:
-            bot.reply_to(msg, "Nhập 3-18")
-            return
+            continue
 
-        tx = 1 if num >= 11 else 0
+        tx = to_tx(num)
         history.append(tx)
 
-        # lưu data
         with open("data.txt", "a") as f:
             f.write(str(num) + "\n")
 
-        # AUTO TRAIN (tối ưu)
-        with open("data.txt") as f:
-            lines = f.readlines()
+    # auto train
+    if len(history) % 200 == 0:
+        model = train_model()
 
-        if len(lines) % 200 == 0:
-            model = train_model()
+    pattern = detect_pattern()
+    cycle = detect_cycle()
+    ai, _ = predict_ai()
+    result, conf = vote(pattern, cycle, ai)
 
-        pattern = detect_pattern()
-        cycle = detect_cycle()
-        ai, prob_ai = predict_ai()
-
-        result, confidence = vote(pattern, cycle, ai)
-
-        bot.reply_to(msg,
+    bot.reply_to(msg,
 f"""
-KQ: {num}
+KQ: {nums[-1]}
 
 Cầu: {pattern}
 Chu kỳ: {cycle}
@@ -218,11 +233,9 @@ Chu kỳ: {cycle}
 AI: {"TÀI" if ai==1 else "XỈU" if ai==0 else "??"}
 
 => Dự đoán: {result}
-Tin cậy: {round(confidence*100)}%
+Tin cậy: {round(conf*100)}%
 """
-        )
+    )
 
-    except:
-        bot.reply_to(msg, "Sai định dạng")
-
+# ================= RUN =================
 bot.polling()
