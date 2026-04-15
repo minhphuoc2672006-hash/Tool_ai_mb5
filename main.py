@@ -6,8 +6,9 @@ import logging
 import math
 import os
 import re
+import itertools
 from collections import Counter
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Iterable
 
 import requests
 from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
@@ -40,11 +41,20 @@ STATE_FILE = os.getenv("STATE_FILE", "state.json").strip()
 MODEL_FILE = os.getenv("MODEL_FILE", "model.json").strip()
 
 PATTERN_LENS = [25, 20, 15, 10, 7]
+
+# Cắt dữ liệu train để tránh model phình quá lớn
+TRAIN_MAX_ITEMS = int(os.getenv("TRAIN_MAX_ITEMS", "12000"))
+
 TRAIN_DECAY = float(os.getenv("TRAIN_DECAY", "0.9995"))
 LIVE_HISTORY_LOOKBACK = int(os.getenv("LIVE_HISTORY_LOOKBACK", "30"))
 MIN_SUPPORT_FOR_CHOT = float(os.getenv("MIN_SUPPORT_FOR_CHOT", "3"))
-FUZZY_THRESHOLD = float(os.getenv("FUZZY_THRESHOLD", "0.84"))
+
+# Fuzzy chỉ đi theo số bước lật ký tự, không quét toàn bộ model
+MAX_FUZZY_DISTANCE = int(os.getenv("MAX_FUZZY_DISTANCE", "2"))
 FUZZY_TOP_K = int(os.getenv("FUZZY_TOP_K", "3"))
+
+# Giới hạn độ dài trả lời để tránh Telegram timeout / lỗi quá dài
+MAX_REPLY_CHARS = int(os.getenv("MAX_REPLY_CHARS", "3500"))
 
 # =========================================
 
@@ -81,6 +91,11 @@ def menu_keyboard() -> ReplyKeyboardMarkup:
 
 def is_admin(uid: int) -> bool:
     return (not ADMIN_IDS) or (uid in ADMIN_IDS)
+
+def truncate_text(text: str, limit: int = MAX_REPLY_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n\n…(đã rút gọn để tránh quá dài)"
 
 # =========================================
 # DATA CONVERSION
@@ -191,6 +206,11 @@ def load_data() -> None:
                 raw = f.read()
 
         BIG_DATA = extract_tx(raw)
+
+        # Cắt bớt để train nhanh hơn
+        if len(BIG_DATA) > TRAIN_MAX_ITEMS:
+            BIG_DATA = BIG_DATA[-TRAIN_MAX_ITEMS:]
+
         logging.info("Loaded BIG_DATA: %d items", len(BIG_DATA))
     except Exception as e:
         logging.exception("load_data failed: %s", e)
@@ -228,6 +248,7 @@ def save_model() -> None:
             "pattern_lens": PATTERN_LENS,
             "train_decay": TRAIN_DECAY,
             "big_data_size": len(BIG_DATA),
+            "train_max_items": TRAIN_MAX_ITEMS,
         },
         "raw": RAW_MODEL,
     }
@@ -305,6 +326,11 @@ def train_raw_model(
 def train_all() -> None:
     global RAW_MODEL, MODEL_READY
 
+    if not BIG_DATA:
+        RAW_MODEL = {}
+        MODEL_READY = False
+        return
+
     RAW_MODEL = train_raw_model(BIG_DATA)
     rebuild_model_index()
     MODEL_READY = True
@@ -348,7 +374,6 @@ def decision_from_counts(c: Counter, total: float) -> str:
 def entry_vote(entry: Dict[str, float], priority: float = 1.0) -> List[Tuple[str, float]]:
     """
     Chuyển model entry thành vote.
-    Có dùng entropy để giảm overfit, nhưng không chặn hẳn quá mạnh.
     """
     t = float(entry.get("T", 0.0))
     x = float(entry.get("X", 0.0))
@@ -392,41 +417,70 @@ def fallback_baseline() -> Tuple[Counter, float]:
 # RECOGNITION
 # =========================================
 
-def positional_similarity(a: List[str], b: List[str]) -> float:
-    if len(a) != len(b) or not a:
-        return 0.0
-    same = sum(1 for x, y in zip(a, b) if x == y)
-    return same / len(a)
+def flip_symbol(ch: str) -> str:
+    return "X" if ch == "T" else "T"
 
-def find_fuzzy_candidates(query: List[str], length: int, top_k: int = FUZZY_TOP_K) -> List[Tuple[float, str, Dict[str, float]]]:
+def generate_mutations(seq: List[str], dist: int) -> Iterable[List[str]]:
     """
-    Tìm các pattern gần đúng trong model theo cùng độ dài.
-    Trả về: [(similarity, full_key, entry), ...]
+    Tạo pattern gần đúng bằng cách lật dist vị trí.
+    Chỉ dùng T/X nên rất nhanh.
     """
-    bucket = MODEL_INDEX.get(length, [])
-    if not bucket:
+    if dist <= 0:
+        yield seq[:]
+        return
+
+    n = len(seq)
+    if dist > n:
+        return
+
+    for positions in itertools.combinations(range(n), dist):
+        mutated = seq[:]
+        for pos in positions:
+            mutated[pos] = flip_symbol(mutated[pos])
+        yield mutated
+
+def score_candidate(entry: Dict[str, float], dist: int, length: int) -> float:
+    t = float(entry.get("T", 0.0))
+    x = float(entry.get("X", 0.0))
+    support = float(entry.get("support", 0.0))
+    total = t + x
+
+    if total <= 0 or support <= 0:
+        return 0.0
+
+    certainty = abs(t - x) / total
+    similarity = max(0.0, 1.0 - (dist / max(length, 1)))
+
+    return (1.0 + math.log1p(total)) * certainty * similarity
+
+def find_fuzzy_candidates(query: List[str], length: int, top_k: int = FUZZY_TOP_K) -> List[Tuple[float, str, Dict[str, float], int]]:
+    """
+    Tìm pattern gần đúng bằng cách lật 1–2 vị trí rồi lookup thẳng vào dict.
+    Không quét toàn bộ model.
+    """
+    if len(query) < length:
         return []
 
     q = query[-length:]
-    candidates: List[Tuple[float, str, Dict[str, float]]] = []
+    seen = set()
+    candidates: List[Tuple[float, str, Dict[str, float], int]] = []
 
-    for full_key in bucket:
-        _, pat = full_key.split(":", 1)
-        pat_seq = list(pat)
+    for dist in range(1, MAX_FUZZY_DISTANCE + 1):
+        for mutated in generate_mutations(q, dist):
+            key = make_model_key(length, mutated)
+            if key in seen:
+                continue
+            seen.add(key)
 
-        sim = positional_similarity(q, pat_seq)
-        if sim < FUZZY_THRESHOLD:
-            continue
+            entry = RAW_MODEL.get(key)
+            if not entry:
+                continue
 
-        entry = RAW_MODEL.get(full_key)
-        if not entry:
-            continue
+            score = score_candidate(entry, dist, length)
+            if score <= 0:
+                continue
 
-        support = float(entry.get("support", 0.0))
-        bonus = math.log1p(support) * sim
-        score = sim + (bonus / 10.0)
-
-        candidates.append((score, full_key, entry))
+            candidates.append((score, key, entry, dist))
 
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[:top_k]
@@ -434,7 +488,7 @@ def find_fuzzy_candidates(query: List[str], length: int, top_k: int = FUZZY_TOP_
 def analyze_by_model() -> Tuple[str, List[Tuple[str, float]]]:
     """
     Dùng HISTORY chỉ làm input query.
-    Không có chuyện HISTORY chui vào train.
+    Không dùng HISTORY để train.
     """
     if len(HISTORY) < min(PATTERN_LENS):
         return (
@@ -466,7 +520,7 @@ def analyze_by_model() -> Tuple[str, List[Tuple[str, float]]]:
             t_pct = round(float(entry.get("T", 0.0)) * 100 / max(support, 1.0), 1)
             x_pct = round(float(entry.get("X", 0.0)) * 100 / max(support, 1.0), 1)
 
-            text += f"   • Khớp chính xác\n"
+            text += "   • Khớp chính xác\n"
             text += f"   • Support: {round(support, 2)}\n"
             text += f"   • T: {t_pct}% | X: {x_pct}%\n"
             text += f"   • => {decision_from_counts(c, total_w)}\n\n"
@@ -478,7 +532,7 @@ def analyze_by_model() -> Tuple[str, List[Tuple[str, float]]]:
         fuzzy = find_fuzzy_candidates(query, L, top_k=FUZZY_TOP_K)
         if fuzzy:
             text += "   • Khớp gần đúng:\n"
-            for score, full_key, cand_entry in fuzzy:
+            for score, full_key, cand_entry, dist in fuzzy:
                 cand_support = float(cand_entry.get("support", 0.0))
                 votes = entry_vote(cand_entry, priority=score)
 
@@ -486,9 +540,11 @@ def analyze_by_model() -> Tuple[str, List[Tuple[str, float]]]:
                 t_pct = round(float(cand_entry.get("T", 0.0)) * 100 / max(cand_support, 1.0), 1)
                 x_pct = round(float(cand_entry.get("X", 0.0)) * 100 / max(cand_support, 1.0), 1)
 
-                text += f"   • {full_key.split(':', 1)[1]} | score={score:.3f} | support={cand_support:.2f}\n"
-                text += f"     T: {t_pct}% | X: {x_pct}%\n"
-                text += f"     => {decision_from_counts(c, total_w)}\n"
+                text += (
+                    f"   • {full_key.split(':', 1)[1]} | dist={dist} | score={score:.3f} | support={cand_support:.2f}\n"
+                    f"     T: {t_pct}% | X: {x_pct}%\n"
+                    f"     => {decision_from_counts(c, total_w)}\n"
+                )
 
                 if cand_support >= MIN_SUPPORT_FOR_CHOT:
                     final_pool += votes
@@ -560,7 +616,8 @@ def model_status_text() -> str:
         f"RAW keys: {len(RAW_MODEL)}\n"
         f"PATTERN_LENS: {PATTERN_LENS}\n"
         f"TRAIN_DECAY: {TRAIN_DECAY}\n"
-        f"FUZZY_THRESHOLD: {FUZZY_THRESHOLD}\n"
+        f"TRAIN_MAX_ITEMS: {TRAIN_MAX_ITEMS}\n"
+        f"MAX_FUZZY_DISTANCE: {MAX_FUZZY_DISTANCE}\n"
     )
 
 def dashboard_text() -> str:
@@ -601,6 +658,7 @@ def guide_text() -> str:
         "• Dữ liệu nhập tay chỉ để bot so sánh và nhận diện.\n"
         "• Bot đọc được cả T/X và số, kể cả có dấu -, dấu phẩy, hoặc xuống dòng.\n"
         f"• Bot dùng nhiều pattern: {PATTERN_LENS}\n"
+        f"• Fuzzy chỉ lật tối đa {MAX_FUZZY_DISTANCE} vị trí để tránh lag.\n"
         "• /train sẽ train lại model từ BIG_DATA và lưu ra file.\n"
         "• /reloaddata sẽ tải lại dữ liệu gốc rồi train luôn.\n"
     )
@@ -619,7 +677,8 @@ def input_hint_text() -> str:
 
 async def send_menu(update: Update, text: str) -> None:
     if update.message:
-        await update.message.reply_text(text, reply_markup=menu_keyboard())
+        safe_text = truncate_text(text)
+        await update.message.reply_text(safe_text, reply_markup=menu_keyboard())
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
