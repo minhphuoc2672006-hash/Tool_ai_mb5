@@ -16,7 +16,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# Ví dụ: ADMIN_IDS="123456789,987654321"
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()
 ADMIN_IDS = [
     int(x.strip())
@@ -44,6 +43,7 @@ logging.basicConfig(
 )
 
 BIG_DATA: List[str] = []
+BIG_RUNS: List[Tuple[str, int]] = []
 HISTORY: List[str] = []
 
 # =========================================
@@ -54,6 +54,7 @@ def menu_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton("📌 Dashboard"), KeyboardButton("➕ Nhập dữ liệu")],
         [KeyboardButton("📊 Thống kê"), KeyboardButton("🔄 Train")],
+        [KeyboardButton("🧩 Cụm"), KeyboardButton("🎯 Chốt cuối")],
         [KeyboardButton("🧹 Reset"), KeyboardButton("🔁 Reload data")],
         [KeyboardButton("ℹ️ Hướng dẫn")],
     ]
@@ -136,12 +137,40 @@ def parse_input(text: str) -> List[str]:
                 out.append(v)
     return out
 
+def build_runs(seq: List[str]) -> List[Tuple[str, int]]:
+    """
+    T T X X X T  -> [('T', 2), ('X', 3), ('T', 1)]
+    """
+    runs: List[Tuple[str, int]] = []
+    if not seq:
+        return runs
+
+    cur = seq[0]
+    cnt = 1
+
+    for s in seq[1:]:
+        if s == cur:
+            cnt += 1
+        else:
+            runs.append((cur, cnt))
+            cur = s
+            cnt = 1
+
+    runs.append((cur, cnt))
+    return runs
+
+def runs_to_text(runs: List[Tuple[str, int]], limit: int = 8) -> str:
+    part = runs[-limit:]
+    if not part:
+        return "(trống)"
+    return " ".join(f"{s}({n})" for s, n in part)
+
 # =========================================
 # LOAD / SAVE
 # =========================================
 
 def load_data() -> None:
-    global BIG_DATA
+    global BIG_DATA, BIG_RUNS
     raw = ""
     try:
         if DATA_SOURCE == "url":
@@ -153,10 +182,14 @@ def load_data() -> None:
                 raw = f.read()
 
         BIG_DATA = extract_tx(raw)
+        BIG_RUNS = build_runs(BIG_DATA)
+
         logging.info("Loaded BIG_DATA: %d items", len(BIG_DATA))
+        logging.info("Loaded BIG_RUNS: %d runs", len(BIG_RUNS))
     except Exception as e:
         logging.exception("load_data failed: %s", e)
         BIG_DATA = []
+        BIG_RUNS = []
 
 def save() -> None:
     try:
@@ -208,6 +241,36 @@ def scan_hits(data: List[str], pattern: List[str], max_mismatches: int = 0) -> L
 
     return hits
 
+def scan_run_hits(
+    runs: List[Tuple[str, int]],
+    pattern_runs: List[Tuple[str, int]],
+    max_len_gap: int = 0
+) -> List[str]:
+    """
+    Match theo cụm:
+    [('T',2),('X',3)] sẽ đi tìm trong runs.
+    Trả về symbol của run kế tiếp sau cụm match.
+    """
+    hits: List[str] = []
+    n = len(pattern_runs)
+
+    if n == 0 or len(runs) < n + 1:
+        return hits
+
+    for i in range(len(runs) - n):
+        window = runs[i:i + n]
+        ok = True
+
+        for (s1, l1), (s2, l2) in zip(window, pattern_runs):
+            if s1 != s2 or abs(l1 - l2) > max_len_gap:
+                ok = False
+                break
+
+        if ok:
+            hits.append(runs[i + n][0])
+
+    return hits
+
 def weighted_counts(results: List[Tuple[str, float]]) -> Tuple[Counter, float]:
     c = Counter()
     total_weight = 0.0
@@ -216,30 +279,37 @@ def weighted_counts(results: List[Tuple[str, float]]) -> Tuple[Counter, float]:
         total_weight += weight
     return c, total_weight
 
+def decision_from_counts(c: Counter, total: float) -> str:
+    if total <= 0:
+        return "⛔ Chưa đủ dữ liệu để chốt"
+
+    t = c.get("T", 0.0)
+    x = c.get("X", 0.0)
+    tp = (t * 100 / total) if total else 0.0
+    xp = (x * 100 / total) if total else 0.0
+
+    if abs(tp - xp) < 3:
+        return "⛔ BỎ QUA (cân kèo)"
+
+    if tp > xp:
+        if tp >= 60:
+            return f"🔥 CHỐT TÀI ({round(tp, 1)}%)"
+        return f"⚠️ TÀI (yếu) ({round(tp, 1)}%)"
+    else:
+        if xp >= 60:
+            return f"🔥 CHỐT XỈU ({round(xp, 1)}%)"
+        return f"⚠️ XỈU (yếu) ({round(xp, 1)}%)"
+
 # =========================================
-# ANALYSIS
+# ANALYSIS - RAW
 # =========================================
 
-def fallback_baseline() -> Tuple[Counter, float]:
-    """
-    Thống kê nền khi pattern chưa đủ khớp.
-    Ưu tiên HISTORY gần nhất, nếu ít thì dùng BIG_DATA.
-    """
-    source = HISTORY[-30:] if len(HISTORY) >= 6 else BIG_DATA[-200:]
-    if not source:
-        return Counter(), 0.0
-
-    c = Counter(source)
-    total = float(sum(c.values()))
-    return c, total
-
-def analyze_multi() -> str:
+def analyze_raw_section() -> Tuple[str, List[Tuple[str, float]]]:
     if len(HISTORY) < 3:
-        return "❌ Chưa đủ dữ liệu"
+        return "🔹 CẦU THƯỜNG\n❌ Chưa đủ dữ liệu\n\n", []
 
     depths = [3, 4, 5]
-    text = "🧠 PHÂN TÍCH\n\n"
-
+    text = "🔹 CẦU THƯỜNG\n\n"
     final_pool: List[Tuple[str, float]] = []
 
     for d in depths:
@@ -249,14 +319,11 @@ def analyze_multi() -> str:
         pattern = HISTORY[-d:]
         pattern_text = "".join(pattern)
 
-        # Khớp trong BIG_DATA
         exact_hits = scan_hits(BIG_DATA, pattern, max_mismatches=0)
 
-        # Khớp trong HISTORY cũ, không lấy phần đang phân tích
         history_prev = HISTORY[:-d] if len(HISTORY) > d else []
         exact_hits += scan_hits(history_prev, pattern, max_mismatches=0)
 
-        # Nếu ít quá thì thử khớp gần
         soft_hits: List[str] = []
         if len(exact_hits) < 2:
             soft_hits = scan_hits(BIG_DATA, pattern, max_mismatches=MAX_MISMATCHES)
@@ -273,66 +340,150 @@ def analyze_multi() -> str:
             t = c.get("T", 0.0)
             x = c.get("X", 0.0)
 
-            tp = (t * 100 / total_w) if total_w else 0.0
-            xp = (x * 100 / total_w) if total_w else 0.0
-
-            text += f"🔹 Cầu {d}: {pattern_text}\n"
+            text += f"🔸 Pattern {d}: {pattern_text}\n"
             text += f"Khớp: {len(exact_hits)} chính xác, {len(soft_hits)} gần\n"
-            text += f"T: {round(tp, 1)}% | X: {round(xp, 1)}% | Mẫu: {round(total_w, 1)}\n\n"
+            text += f"T: {round((t * 100 / total_w), 1)}% | X: {round((x * 100 / total_w), 1)}% | Mẫu: {round(total_w, 1)}\n"
+            text += f"=> {decision_from_counts(c, total_w)}\n\n"
 
             if total_w >= MIN_SUPPORT_FOR_CHOT:
                 final_pool += depth_pool
         else:
-            text += f"🔹 Cầu {d}: {pattern_text}\n"
+            text += f"🔸 Pattern {d}: {pattern_text}\n"
             text += "Không có khớp chính xác, sẽ dùng nền nếu cần\n\n"
 
-    if not final_pool:
+    return text, final_pool
+
+# =========================================
+# ANALYSIS - CLUSTER
+# =========================================
+
+def analyze_cluster_section() -> Tuple[str, List[Tuple[str, float]]]:
+    if len(HISTORY) < 4:
+        return "🧩 PHÂN TÍCH CỤM\n❌ Chưa đủ dữ liệu cụm\n\n", []
+
+    current_runs = build_runs(HISTORY)
+    if len(current_runs) < 2:
+        return "🧩 PHÂN TÍCH CỤM\n❌ Chưa có cụm đủ dài\n\n", []
+
+    text = "🧩 PHÂN TÍCH CỤM\n\n"
+    final_pool: List[Tuple[str, float]] = []
+
+    for d in [2, 3, 4]:
+        if len(current_runs) < d:
+            continue
+
+        pattern_runs = current_runs[-d:]
+        pattern_text = runs_to_text(pattern_runs, limit=d)
+
+        exact_hits = scan_run_hits(BIG_RUNS, pattern_runs, max_len_gap=0)
+
+        history_prev = HISTORY[:-d] if len(HISTORY) > d else []
+        history_prev_runs = build_runs(history_prev)
+        exact_hits += scan_run_hits(history_prev_runs, pattern_runs, max_len_gap=0)
+
+        soft_hits: List[str] = []
+        if len(exact_hits) < 2:
+            soft_hits = scan_run_hits(BIG_RUNS, pattern_runs, max_len_gap=1)
+            soft_hits += scan_run_hits(history_prev_runs, pattern_runs, max_len_gap=1)
+
+        depth_pool: List[Tuple[str, float]] = []
+        for r in exact_hits:
+            depth_pool.append((r, 1.0))
+        for r in soft_hits:
+            depth_pool.append((r, SOFT_WEIGHT))
+
+        if depth_pool:
+            c, total_w = weighted_counts(depth_pool)
+            text += f"🔸 Cụm {d}: {pattern_text}\n"
+            text += f"Khớp: {len(exact_hits)} chính xác, {len(soft_hits)} gần\n"
+            text += f"T: {round((c.get('T', 0.0) * 100 / total_w), 1)}% | X: {round((c.get('X', 0.0) * 100 / total_w), 1)}% | Mẫu: {round(total_w, 1)}\n"
+            text += f"=> {decision_from_counts(c, total_w)}\n\n"
+
+            if total_w >= MIN_SUPPORT_FOR_CHOT:
+                final_pool += depth_pool
+        else:
+            text += f"🔸 Cụm {d}: {pattern_text}\n"
+            text += "Không có khớp cụm, sẽ dùng nền nếu cần\n\n"
+
+    return text, final_pool
+
+# =========================================
+# FINAL CHOT
+# =========================================
+
+def fallback_baseline() -> Tuple[Counter, float]:
+    source = HISTORY[-30:] if len(HISTORY) >= 6 else BIG_DATA[-200:]
+    if not source:
+        return Counter(), 0.0
+
+    c = Counter(source)
+    total = float(sum(c.values()))
+    return c, total
+
+def build_final_chot(raw_pool: List[Tuple[str, float]], cluster_pool: List[Tuple[str, float]]) -> str:
+    """
+    Chốt cuối:
+    - ưu tiên cụm
+    - vẫn cộng raw vào để soi lại hết
+    - nếu không có gì thì dùng nền
+    """
+    title = "🎯 CHỐT CUỐI THEO CỤM" if cluster_pool else "🎯 CHỐT CUỐI THEO DỮ LIỆU"
+
+    if not raw_pool and not cluster_pool:
         base_counts, base_total = fallback_baseline()
         if base_total <= 0:
-            text += "⛔ Chưa đủ dữ liệu để chốt"
-            return text
+            return "🎯 CHỐT CUỐI\nKhông đủ dữ liệu để chốt"
 
         t = base_counts.get("T", 0)
         x = base_counts.get("X", 0)
         tp = (t * 100 / base_total) if base_total else 0.0
         xp = (x * 100 / base_total) if base_total else 0.0
 
-        text += "📌 Nền dữ liệu\n"
-        text += f"T: {round(tp, 1)}% | X: {round(xp, 1)}% | Mẫu: {int(base_total)}\n\n"
-
-        if abs(tp - xp) < 3:
-            text += "⛔ BỎ QUA (nền cân kèo)"
-            return text
-
-        if tp > xp:
-            text += f"⚠️ TÀI (nền) ({round(tp, 1)}%)"
+        if tp >= xp:
+            pred = "TÀI"
+            pct = tp
         else:
-            text += f"⚠️ XỈU (nền) ({round(xp, 1)}%)"
-        return text
+            pred = "XỈU"
+            pct = xp
 
-    final_counts, final_weight = weighted_counts(final_pool)
-    t = final_counts.get("T", 0.0)
-    x = final_counts.get("X", 0.0)
+        return f"{title}\nDự đoán: {pred}\nTỷ lệ: {pct:.1f}%"
 
-    tp = (t * 100 / final_weight) if final_weight else 0.0
-    xp = (x * 100 / final_weight) if final_weight else 0.0
+    # Cụm được ưu tiên hơn raw một chút
+    merged: List[Tuple[str, float]] = []
+    for r, w in raw_pool:
+        merged.append((r, w))
+    for r, w in cluster_pool:
+        merged.append((r, w * 1.2))
 
-    if abs(tp - xp) < 3:
-        text += "⛔ BỎ QUA (cân kèo)"
-        return text
+    c, total_w = weighted_counts(merged)
+    t = c.get("T", 0.0)
+    x = c.get("X", 0.0)
 
-    if tp > xp:
-        confidence = tp
-        if confidence >= 60:
-            text += f"🔥 CHỐT TÀI ({round(confidence, 1)}%)"
-        else:
-            text += f"⚠️ TÀI (yếu) ({round(confidence, 1)}%)"
+    tp = (t * 100 / total_w) if total_w else 0.0
+    xp = (x * 100 / total_w) if total_w else 0.0
+
+    if tp >= xp:
+        pred = "TÀI"
+        pct = tp
     else:
-        confidence = xp
-        if confidence >= 60:
-            text += f"🔥 CHỐT XỈU ({round(confidence, 1)}%)"
-        else:
-            text += f"⚠️ XỈU (yếu) ({round(confidence, 1)}%)"
+        pred = "XỈU"
+        pct = xp
+
+    return f"{title}\nDự đoán: {pred}\nTỷ lệ: {pct:.1f}%"
+
+def analyze_multi() -> str:
+    if len(HISTORY) < 3:
+        return "❌ Chưa đủ dữ liệu"
+
+    raw_text, raw_pool = analyze_raw_section()
+    cluster_text, cluster_pool = analyze_cluster_section()
+
+    text = "🧠 PHÂN TÍCH\n\n"
+    text += raw_text
+    text += cluster_text
+
+    final_text = build_final_chot(raw_pool, cluster_pool)
+    text += "\n" + final_text
 
     return text
 
@@ -342,10 +493,12 @@ def analyze_multi() -> str:
 
 def dashboard_text() -> str:
     history_preview = " ".join(HISTORY[-20:]) if HISTORY else "(trống)"
+    cluster_preview = runs_to_text(build_runs(HISTORY), limit=8)
     return (
         "📌 DASHBOARD\n\n"
         f"📚 BIG_DATA: {len(BIG_DATA)}\n"
         f"🧠 HISTORY: {len(HISTORY)}\n"
+        f"🧩 Cụm gần nhất: {cluster_preview}\n"
         f"🔎 20 kết quả gần nhất: {history_preview}\n\n"
         f"{analyze_multi()}"
     )
@@ -365,6 +518,7 @@ def stats_text() -> str:
         f"🔥 T: {t} ({round(tp, 1)}%)\n"
         f"🧊 X: {x} ({round(xp, 1)}%)\n"
         f"📚 BIG_DATA: {len(BIG_DATA)}\n"
+        f"🧩 Cụm gần nhất: {runs_to_text(build_runs(HISTORY), limit=8)}\n"
     )
 
 def guide_text() -> str:
@@ -375,6 +529,8 @@ def guide_text() -> str:
         "• /reset chỉ xóa HISTORY, không đụng BIG_DATA.\n"
         "• BIG_DATA là dữ liệu gốc từ data.txt hoặc URL.\n"
         "• Bot đọc được cả T/X và số, kể cả có dấu -, dấu phẩy, hoặc xuống dòng.\n"
+        "• Mục 🧩 Cụm sẽ xem dữ liệu theo chuỗi chạy liên tiếp.\n"
+        "• Mục 🎯 Chốt cuối sẽ gom hết rồi chốt một dòng riêng.\n"
     )
 
 def input_hint_text() -> str:
@@ -414,13 +570,13 @@ async def reload_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_admin(update.effective_user.id):
         return
+
     if not update.message:
         return
 
     text = update.message.text or ""
     stripped = text.strip()
 
-    # Nút giao diện
     if stripped == "📌 Dashboard":
         await send_menu(update, dashboard_text())
         return
@@ -431,6 +587,27 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if stripped == "🔄 Train":
         await send_menu(update, analyze_multi())
+        return
+
+    if stripped == "🧩 Cụm":
+        cluster_text, cluster_pool = analyze_cluster_section()
+        reply = cluster_text
+        reply += "🎯 KẾT CỤM\n"
+        if cluster_pool:
+            c, total_w = weighted_counts(cluster_pool)
+            reply += build_final_chot([], cluster_pool) + "\n"
+            reply += f"Độ lệch: {abs((c.get('T',0.0) - c.get('X',0.0))):.1f}"
+        else:
+            reply += "Chưa đủ dữ liệu cụm để chốt"
+        await send_menu(update, reply)
+        return
+
+    if stripped == "🎯 Chốt cuối":
+        raw_text, raw_pool = analyze_raw_section()
+        cluster_text, cluster_pool = analyze_cluster_section()
+        reply = build_final_chot(raw_pool, cluster_pool)
+        reply = "🎯 CHỐT CUỐI\n\n" + reply
+        await send_menu(update, reply)
         return
 
     if stripped == "🧹 Reset":
@@ -451,7 +628,6 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await reload_data(update, ctx)
         return
 
-    # Xử lý dữ liệu người dùng nhập vào
     vals = parse_input(text)
     if not vals:
         return
