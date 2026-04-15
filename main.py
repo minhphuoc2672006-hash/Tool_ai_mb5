@@ -32,32 +32,34 @@ STATE_FILE = "state.pkl"
 
 MAX_HISTORY = 800
 WINDOW_SIZES = [4, 5, 6, 7, 8, 9, 10, 11, 12]
+
 MIN_CLUSTER_SIM = 0.72
 MAX_CLUSTER_SAMPLES = 120
 MIN_CLUSTER_COUNT_TO_SHOW = 2
-MIN_NEXT_TX_TO_TRUST = 3
+
+MIN_NEXT_TX_TO_TRUST = 4
+MIN_CLUSTER_EDGE = 0.15
+MAX_SAME_SIDE_PRED = 2
 
 # ================= MEMORY =================
 raw_numbers: List[int] = []
 tx_stream: List[Optional[int]] = []
 valid_tx: List[int] = []
 
-# streaks chỉ là độ dài các chuỗi liên tiếp T/X
 streaks: List[int] = []
-# streak_blocks giữ cả loại chuỗi và độ dài: [(tx, length), ...]
 streak_blocks: List[Tuple[int, int]] = []
 
 state = {
-    "markov": {},   # { (a,b,c): [x_count, t_count] }
-    "clusters": {}, # { win_size: {cluster_id: {...}} }
+    "markov": {},
+    "clusters": {},
 }
 
-# Giữ đòn / giữ kèo
 prediction_memory = {
-    "label": None,         # "TÀI" / "XỈU"
+    "label": None,
     "pct": 50.0,
-    "cluster_sig": None,   # (window, cluster_id)
+    "cluster_sig": None,
     "hold_count": 0,
+    "same_side_count": 0,
 }
 
 def reset_prediction_memory():
@@ -65,6 +67,7 @@ def reset_prediction_memory():
     prediction_memory["pct"] = 50.0
     prediction_memory["cluster_sig"] = None
     prediction_memory["hold_count"] = 0
+    prediction_memory["same_side_count"] = 0
 
 # ================= PERMISSION =================
 def is_admin_user_id(user_id: int) -> bool:
@@ -94,7 +97,6 @@ def parse_input(text: str) -> List[int]:
     return out
 
 def to_tx(num: int) -> Optional[int]:
-    # 11-17 = Tài, 4-10 = Xỉu, 3/18 = bão
     if num in (3, 18):
         return None
     if 11 <= num <= 17:
@@ -115,10 +117,6 @@ def safe_percent(x: float) -> int:
 
 # ================= STREAKS =================
 def build_streak_blocks(seq: List[Optional[int]]) -> List[Tuple[int, int]]:
-    """
-    Trả về danh sách block liên tiếp:
-    [(tx, length), ...]
-    """
     out: List[Tuple[int, int]] = []
     current = None
     count = 0
@@ -245,10 +243,6 @@ def merge_sample_into_clusters(clusters: Dict[str, dict], sample: Tuple[int, ...
         clusters[new_id]["next_tx"][next_tx] += 1
 
 def build_clusters_from_blocks(blocks: List[Tuple[int, int]]) -> Dict[int, Dict[str, dict]]:
-    """
-    Dùng chuỗi độ dài streak để tạo cụm.
-    Đồng thời học next_tx của streak tiếp theo.
-    """
     lengths = [length for _, length in blocks]
     next_vals = [tx for tx, _ in blocks]
 
@@ -257,18 +251,10 @@ def build_clusters_from_blocks(blocks: List[Tuple[int, int]]) -> Dict[int, Dict[
     for win in WINDOW_SIZES:
         clusters = {}
         if len(lengths) >= win:
-            for i in range(len(lengths) - win):
+            for i in range(len(lengths) - win + 1):
                 sample = tuple(lengths[i:i + win])
                 next_tx = next_vals[i + win] if (i + win) < len(next_vals) else None
                 merge_sample_into_clusters(clusters, sample, i, next_tx)
-
-            # trường hợp cuối cùng có sample nhưng không có next_tx
-            if len(lengths) >= win:
-                last_i = len(lengths) - win
-                sample = tuple(lengths[last_i:last_i + win])
-                next_tx = None
-                merge_sample_into_clusters(clusters, sample, last_i, next_tx)
-
         clusters_by_window[win] = clusters
 
     return clusters_by_window
@@ -281,12 +267,7 @@ def save_data_append(nums: List[int]):
 
 def save_state():
     with open(STATE_FILE, "wb") as f:
-        pickle.dump(
-            {
-                "raw_numbers": raw_numbers,
-            },
-            f,
-        )
+        pickle.dump({"raw_numbers": raw_numbers}, f)
 
 def load_state_file():
     if not os.path.exists(STATE_FILE):
@@ -324,17 +305,15 @@ def rebuild_all():
     streak_blocks = build_streak_blocks(tx_stream)
     streaks = build_streak_lengths(streak_blocks)
 
-    # Markov 3-bước
     markov = {}
     if len(valid_tx) >= 4:
         for i in range(len(valid_tx) - 3):
             key = tuple(valid_tx[i:i + 3])
             nxt = valid_tx[i + 3]
             if key not in markov:
-                markov[key] = [0, 0]  # [X, T]
+                markov[key] = [0, 0]
             markov[key][nxt] += 1
 
-    # Clusters đa cửa sổ
     clusters = build_clusters_from_blocks(streak_blocks)
 
     state = {
@@ -429,7 +408,12 @@ def analyze_status():
         next_x, next_t = cluster.get("next_tx", [0, 0])
         total_next = next_x + next_t
         if total_next >= MIN_NEXT_TX_TO_TRUST:
-            score += 0.20
+            p_t = next_t / total_next
+            p_x = next_x / total_next
+            if abs(p_t - p_x) >= MIN_CLUSTER_EDGE:
+                score += 0.20
+            else:
+                score += 0.05
         elif cluster["kind"] in ("BỆT_ĐỀU", "ĐẢO/SHORT-LONG"):
             score += 0.10
 
@@ -437,8 +421,8 @@ def analyze_status():
 
     if len(valid_tx) >= 10:
         bias = sum(valid_tx) / len(valid_tx)
-        if 0.40 <= bias <= 0.60:
-            score += 0.05
+        if bias > 0.68 or bias < 0.32:
+            score += 0.03
 
     score = max(0.0, min(1.0, score))
 
@@ -449,10 +433,6 @@ def analyze_status():
     return "Cụm rõ", score
 
 def cluster_primary_direction(cluster) -> Optional[int]:
-    """
-    Dùng outcome của cluster trước, nếu đủ dữ liệu thì lấy nó.
-    Trả về: 1 = TÀI, 0 = XỈU, None = không rõ.
-    """
     if not cluster:
         return None
 
@@ -462,7 +442,7 @@ def cluster_primary_direction(cluster) -> Optional[int]:
     if total >= MIN_NEXT_TX_TO_TRUST:
         p_t = next_t / total
         p_x = next_x / total
-        if abs(p_t - p_x) >= 0.08:
+        if abs(p_t - p_x) >= MIN_CLUSTER_EDGE:
             return 1 if p_t > p_x else 0
 
     kind = cluster.get("kind")
@@ -485,8 +465,8 @@ def cluster_primary_direction(cluster) -> Optional[int]:
 def make_prediction(stateful: bool = False):
     """
     Cụm là chính, IT/Markov chỉ phụ.
-    stateful=False: chỉ tính toán, không giữ đòn.
-    stateful=True : áp dụng giữ đòn cho cụm mạnh.
+    Yếu vẫn dự đoán bình thường.
+    Chỉ thêm cân bằng nhẹ để tránh nghiêng một phía quá nhiều.
     """
     cluster = get_current_cluster()
     ai_pred, ai_conf = predict_markov()
@@ -511,29 +491,31 @@ def make_prediction(stateful: bool = False):
             weight = 0.55
 
         if total_next >= MIN_NEXT_TX_TO_TRUST:
-            # cluster nhớ kết quả sau đó -> dùng làm nguồn chính
             p_t = next_t / total_next
             p_x = next_x / total_next
 
-            score_t += 3.0 * weight * p_t
-            score_x += 3.0 * weight * p_x
+            if abs(p_t - p_x) >= MIN_CLUSTER_EDGE:
+                score_t += 3.0 * weight * p_t
+                score_x += 3.0 * weight * p_x
+            else:
+                score_t += 0.35 * weight * p_t
+                score_x += 0.35 * weight * p_x
         else:
-            # chưa đủ outcome thì dùng bản chất của cụm
             primary = cluster_primary_direction(cluster)
             if kind in ("BỆT_ĐỀU", "ĐẢO/SHORT-LONG") and primary is not None:
                 if primary == 1:
-                    score_t += 2.8 * weight
-                    score_x += 0.10 * weight
+                    score_t += 2.2 * weight
+                    score_x += 0.25 * weight
                 else:
-                    score_x += 2.8 * weight
-                    score_t += 0.10 * weight
+                    score_x += 2.2 * weight
+                    score_t += 0.25 * weight
             else:
-                score_t += 0.25 * weight
-                score_x += 0.25 * weight
+                score_t += 0.45 * weight
+                score_x += 0.45 * weight
 
     # ===== IT / MARKOV CHỈ PHỤ =====
     if ai_pred is not None:
-        markov_weight = 0.20
+        markov_weight = 0.12
         if cluster and cluster["score"] >= 0.88 and cluster["kind"] in ("BỆT_ĐỀU", "ĐẢO/SHORT-LONG"):
             markov_weight = 0.05
 
@@ -542,13 +524,13 @@ def make_prediction(stateful: bool = False):
         else:
             score_x += markov_weight * ai_conf
 
-    # ===== BIAS CHUNG NHẸ =====
+    # ===== BIAS CHUNG RẤT NHẸ =====
     if len(valid_tx) >= 10:
         bias = sum(valid_tx) / len(valid_tx)
-        if bias > 0.65:
-            score_x += 0.15
-        elif bias < 0.35:
-            score_t += 0.15
+        if bias > 0.68:
+            score_x += 0.05
+        elif bias < 0.32:
+            score_t += 0.05
 
     total = score_t + score_x
     if total <= 0:
@@ -556,10 +538,36 @@ def make_prediction(stateful: bool = False):
 
     p_t = score_t / total
     p_x = score_x / total
-    best = max(p_t, p_x)
 
-    if best < 0.56:
-        return "KHÔNG RÕ", round(best * 100, 1)
+    # ===== CÂN BẰNG ĐỂ KHÔNG NGHIÊNG MỘT PHÍA =====
+    # Nếu vừa ra cùng một phía quá nhiều lần, giảm nhẹ phía đó chứ không cấm dự đoán
+    if stateful:
+        last = prediction_memory.get("label")
+        same_side = prediction_memory.get("same_side_count", 0)
+
+        current_label = "TÀI" if p_t >= p_x else "XỈU"
+
+        if last == current_label:
+            same_side += 1
+        else:
+            same_side = 1
+
+        prediction_memory["same_side_count"] = same_side
+
+        if same_side >= 3 and abs(p_t - p_x) < 0.20:
+            if current_label == "TÀI":
+                p_t *= 0.92
+                p_x *= 1.05
+            else:
+                p_x *= 0.92
+                p_t *= 1.05
+
+            total = p_t + p_x
+            if total > 0:
+                p_t /= total
+                p_x /= total
+
+    best = max(p_t, p_x)
 
     if p_t > p_x:
         label = "TÀI"
@@ -568,30 +576,12 @@ def make_prediction(stateful: bool = False):
         label = "XỈU"
         pct = round(p_x * 100, 1)
 
-    # ===== GIỮ ĐÒN =====
-    if stateful and cluster and cluster["score"] >= 0.85 and cluster["kind"] in ("BỆT_ĐỀU", "ĐẢO/SHORT-LONG"):
-        cluster_sig = (cluster["window"], cluster["id"])
+    if best < 0.52:
+        pct = round(best * 100, 1)
 
-        if (
-            prediction_memory["label"] is not None
-            and prediction_memory["cluster_sig"] == cluster_sig
-            and prediction_memory["hold_count"] < 2
-        ):
-            prediction_memory["hold_count"] += 1
-            return prediction_memory["label"], prediction_memory["pct"]
-
-        if label != "KHÔNG_RÕ":
-            prediction_memory["label"] = label
-            prediction_memory["pct"] = pct
-            prediction_memory["cluster_sig"] = cluster_sig
-            prediction_memory["hold_count"] = 0
-
-    elif stateful:
-        prediction_memory["hold_count"] = 0
-        if label != "KHÔNG_RÕ":
-            prediction_memory["label"] = label
-            prediction_memory["pct"] = pct
-            prediction_memory["cluster_sig"] = None
+    if stateful and label != "KHÔNG_RÕ":
+        prediction_memory["label"] = label
+        prediction_memory["pct"] = pct
 
     return label, pct
 
