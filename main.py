@@ -25,14 +25,15 @@ ADMIN_IDS = [
 ]
 
 DATA_SOURCE = os.getenv("DATA_SOURCE", "url").strip().lower()  # url hoặc file
-DATA_URL = os.getenv("DATA_URL", "https://raw.githubusercontent.com/USERNAME/REPO/main/data.txt").strip()
+DATA_URL = os.getenv(
+    "DATA_URL",
+    "https://raw.githubusercontent.com/USERNAME/REPO/main/data.txt"
+).strip()
 DATA_FILE = os.getenv("DATA_FILE", "data.txt").strip()
 STATE_FILE = os.getenv("STATE_FILE", "state.json").strip()
 
-# Chỉnh nhẹ để bot không quá chặt
-MAX_MISMATCHES = int(os.getenv("MAX_MISMATCHES", "1"))        # khớp gần cho pattern 3-5
-SOFT_WEIGHT = float(os.getenv("SOFT_WEIGHT", "0.6"))          # trọng số khớp gần
-FALLBACK_WEIGHT = float(os.getenv("FALLBACK_WEIGHT", "0.3"))  # trọng số thống kê nền
+MAX_MISMATCHES = int(os.getenv("MAX_MISMATCHES", "1"))
+SOFT_WEIGHT = float(os.getenv("SOFT_WEIGHT", "0.6"))
 MIN_SUPPORT_FOR_CHOT = int(os.getenv("MIN_SUPPORT_FOR_CHOT", "3"))
 
 # =========================================
@@ -53,9 +54,14 @@ def menu_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton("📌 Dashboard"), KeyboardButton("➕ Nhập dữ liệu")],
         [KeyboardButton("📊 Thống kê"), KeyboardButton("🔄 Train")],
-        [KeyboardButton("🧹 Reset"), KeyboardButton("ℹ️ Hướng dẫn")],
+        [KeyboardButton("🧹 Reset"), KeyboardButton("🔁 Reload data")],
+        [KeyboardButton("ℹ️ Hướng dẫn")],
     ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
+    return ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True,
+        is_persistent=True
+    )
 
 def is_admin(uid: int) -> bool:
     return (not ADMIN_IDS) or (uid in ADMIN_IDS)
@@ -81,17 +87,53 @@ def tx(n: int) -> Optional[str]:
         return "T"
     return None
 
-def parse(text: str) -> List[int]:
+def extract_tx(raw: str) -> List[str]:
+    """
+    Đọc được:
+    - T X T X
+    - 12-13-8-9
+    - 12 13 8 9
+    - 12,13,8,9
+    - xuống dòng, tab, dấu gạch
+    """
+    if not raw:
+        return []
+
+    raw = raw.upper().replace("-", " ").replace(",", " ")
+    tokens = re.findall(r"[TX]|\d+", raw)
+
+    out: List[str] = []
+    for tok in tokens:
+        if tok in ("T", "X"):
+            out.append(tok)
+        else:
+            v = tx(int(tok))
+            if v is not None:
+                out.append(v)
+    return out
+
+def parse_input(text: str) -> List[str]:
+    """
+    Parse dữ liệu người dùng nhập vào bot.
+    Chấp nhận:
+    - T X X T
+    - 12-13-8
+    - 12 13 8
+    """
     if not text:
         return []
-    return [int(x) for x in re.findall(r"\d+", text)]
 
-def to_tx_list(nums: List[int]) -> List[str]:
+    text = text.upper().replace("-", " ").replace(",", " ")
+    tokens = re.findall(r"[TX]|\d+", text)
+
     out: List[str] = []
-    for n in nums:
-        v = tx(n)
-        if v is not None:
-            out.append(v)
+    for tok in tokens:
+        if tok in ("T", "X"):
+            out.append(tok)
+        else:
+            v = tx(int(tok))
+            if v is not None:
+                out.append(v)
     return out
 
 # =========================================
@@ -110,8 +152,7 @@ def load_data() -> None:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 raw = f.read()
 
-        nums = [int(x) for x in re.findall(r"\d+", raw)]
-        BIG_DATA = to_tx_list(nums)
+        BIG_DATA = extract_tx(raw)
         logging.info("Loaded BIG_DATA: %d items", len(BIG_DATA))
     except Exception as e:
         logging.exception("load_data failed: %s", e)
@@ -133,6 +174,7 @@ def load() -> None:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+
         h = data.get("h", [])
         if isinstance(h, list):
             HISTORY = [x for x in h if x in ("T", "X")]
@@ -149,8 +191,8 @@ def load() -> None:
 def scan_hits(data: List[str], pattern: List[str], max_mismatches: int = 0) -> List[str]:
     """
     Trả về danh sách kết quả ngay sau pattern.
-    max_mismatches = 0 là khớp chính xác.
-    max_mismatches = 1 là khớp gần.
+    max_mismatches = 0: khớp chính xác
+    max_mismatches = 1: khớp gần
     """
     hits: List[str] = []
     n = len(pattern)
@@ -199,7 +241,6 @@ def analyze_multi() -> str:
     text = "🧠 PHÂN TÍCH\n\n"
 
     final_pool: List[Tuple[str, float]] = []
-    support_total = 0.0
 
     for d in depths:
         if len(HISTORY) < d:
@@ -208,22 +249,18 @@ def analyze_multi() -> str:
         pattern = HISTORY[-d:]
         pattern_text = "".join(pattern)
 
-        # 1) Khớp chính xác trong BIG_DATA
+        # Khớp trong BIG_DATA
         exact_hits = scan_hits(BIG_DATA, pattern, max_mismatches=0)
 
-        # 2) Khớp chính xác trong lịch sử cũ, bỏ phần đang nhập hiện tại
+        # Khớp trong HISTORY cũ, không lấy phần đang phân tích
         history_prev = HISTORY[:-d] if len(HISTORY) > d else []
         exact_hits += scan_hits(history_prev, pattern, max_mismatches=0)
 
-        # 3) Nếu ít quá thì dùng khớp gần
+        # Nếu ít quá thì thử khớp gần
         soft_hits: List[str] = []
         if len(exact_hits) < 2:
             soft_hits = scan_hits(BIG_DATA, pattern, max_mismatches=MAX_MISMATCHES)
             soft_hits += scan_hits(history_prev, pattern, max_mismatches=MAX_MISMATCHES)
-
-            # bỏ bớt phần exact đã có để tránh lặp trọng số quá nhiều
-            # không cần loại tuyệt đối, chỉ cần cân bằng nhẹ
-            soft_hits = soft_hits[:]
 
         depth_pool: List[Tuple[str, float]] = []
         for r in exact_hits:
@@ -243,13 +280,11 @@ def analyze_multi() -> str:
             text += f"Khớp: {len(exact_hits)} chính xác, {len(soft_hits)} gần\n"
             text += f"T: {round(tp, 1)}% | X: {round(xp, 1)}% | Mẫu: {round(total_w, 1)}\n\n"
 
-            # Chỉ cộng vào chốt nếu có đủ lực
             if total_w >= MIN_SUPPORT_FOR_CHOT:
                 final_pool += depth_pool
-                support_total += total_w
         else:
             text += f"🔹 Cầu {d}: {pattern_text}\n"
-            text += "Không có khớp chính xác, dùng nền nếu cần\n\n"
+            text += "Không có khớp chính xác, sẽ dùng nền nếu cần\n\n"
 
     if not final_pool:
         base_counts, base_total = fallback_baseline()
@@ -339,7 +374,7 @@ def guide_text() -> str:
         "• 3–10 = X, 11–18 = T.\n"
         "• /reset chỉ xóa HISTORY, không đụng BIG_DATA.\n"
         "• BIG_DATA là dữ liệu gốc từ data.txt hoặc URL.\n"
-        "• Bot sẽ thử khớp chính xác, khớp gần rồi mới dùng nền.\n"
+        "• Bot đọc được cả T/X và số, kể cả có dấu -, dấu phẩy, hoặc xuống dòng.\n"
     )
 
 def input_hint_text() -> str:
@@ -354,32 +389,31 @@ def input_hint_text() -> str:
 # HANDLERS
 # =========================================
 
-async def send_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+async def send_menu(update: Update, text: str) -> None:
     if update.message:
         await update.message.reply_text(text, reply_markup=menu_keyboard())
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_admin(update.effective_user.id):
         return
-    await send_menu(update, ctx, "Bot đã sẵn sàng 🔥")
+    await send_menu(update, "Bot đã sẵn sàng 🔥")
 
 async def reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_admin(update.effective_user.id):
         return
     HISTORY.clear()
     save()
-    await send_menu(update, ctx, "✅ Reset xong phần lịch sử nhập tay. BIG_DATA vẫn giữ nguyên.")
+    await send_menu(update, "✅ Reset xong phần lịch sử nhập tay. BIG_DATA vẫn giữ nguyên.")
 
 async def reload_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_admin(update.effective_user.id):
         return
     load_data()
-    await send_menu(update, ctx, f"🔄 Đã tải lại BIG_DATA: {len(BIG_DATA)}")
+    await send_menu(update, f"🔄 Đã tải lại BIG_DATA: {len(BIG_DATA)}")
 
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_admin(update.effective_user.id):
         return
-
     if not update.message:
         return
 
@@ -388,56 +422,54 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Nút giao diện
     if stripped == "📌 Dashboard":
-        await send_menu(update, ctx, dashboard_text())
+        await send_menu(update, dashboard_text())
         return
 
     if stripped == "📊 Thống kê":
-        await send_menu(update, ctx, stats_text())
+        await send_menu(update, stats_text())
         return
 
     if stripped == "🔄 Train":
-        await send_menu(update, ctx, analyze_multi())
+        await send_menu(update, analyze_multi())
         return
 
     if stripped == "🧹 Reset":
         HISTORY.clear()
         save()
-        await send_menu(update, ctx, "✅ Reset xong phần lịch sử nhập tay. BIG_DATA vẫn giữ nguyên.")
+        await send_menu(update, "✅ Reset xong phần lịch sử nhập tay. BIG_DATA vẫn giữ nguyên.")
         return
 
     if stripped == "ℹ️ Hướng dẫn":
-        await send_menu(update, ctx, guide_text())
+        await send_menu(update, guide_text())
         return
 
     if stripped == "➕ Nhập dữ liệu":
-        await send_menu(update, ctx, input_hint_text())
+        await send_menu(update, input_hint_text())
         return
 
     if stripped == "🔁 Reload data":
         await reload_data(update, ctx)
         return
 
-    # Xử lý số
-    nums = parse(text)
-    if not nums:
+    # Xử lý dữ liệu người dùng nhập vào
+    vals = parse_input(text)
+    if not vals:
         return
 
     added = []
     ignored = []
 
-    for n in nums:
-        v = tx(n)
-        if v is None:
-            ignored.append(n)
-            continue
-        HISTORY.append(v)
-        added.append(v)
+    for v in vals:
+        if v in ("T", "X"):
+            HISTORY.append(v)
+            added.append(v)
+        else:
+            ignored.append(v)
 
     if not added:
         await send_menu(
             update,
-            ctx,
-            f"⚠️ Không có số hợp lệ trong phạm vi 3–18.\nDữ liệu nhận: {nums}"
+            f"⚠️ Không có giá trị hợp lệ.\nDữ liệu nhận: {vals}"
         )
         return
 
@@ -445,7 +477,7 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     result = analyze_multi()
     reply = (
-        f"📥 Nhận: {nums}\n"
+        f"📥 Nhận: {vals}\n"
         f"➡️ {' '.join(added)}"
     )
 
@@ -454,7 +486,7 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     reply += f"\n\n{result}"
 
-    await send_menu(update, ctx, reply)
+    await send_menu(update, reply)
 
 # =========================================
 # MAIN
