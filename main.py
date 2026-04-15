@@ -33,10 +33,12 @@ DATA_FILE = os.getenv("DATA_FILE", "data.txt").strip()
 STATE_FILE = os.getenv("STATE_FILE", "state.json").strip()
 MODEL_FILE = os.getenv("MODEL_FILE", "model.json").strip()
 
-PATTERN_LEN = int(os.getenv("PATTERN_LEN", "25"))
+PATTERN_LENS = [25, 20, 15, 10, 7]
 TRAIN_DECAY = float(os.getenv("TRAIN_DECAY", "0.9995"))
 LIVE_HISTORY_LOOKBACK = int(os.getenv("LIVE_HISTORY_LOOKBACK", "30"))
 MIN_SUPPORT_FOR_CHOT = float(os.getenv("MIN_SUPPORT_FOR_CHOT", "3"))
+FUZZY_THRESHOLD = float(os.getenv("FUZZY_THRESHOLD", "0.84"))
+FUZZY_TOP_K = int(os.getenv("FUZZY_TOP_K", "3"))
 
 # =========================================
 
@@ -48,7 +50,11 @@ logging.basicConfig(
 BIG_DATA: List[str] = []
 HISTORY: List[str] = []
 
+# Model dạng phẳng:
+# key = "25:TXTX..."
+# value = {"T": ..., "X": ..., "support": ...}
 RAW_MODEL: Dict[str, Dict[str, float]] = {}
+MODEL_INDEX: Dict[int, List[str]] = {}
 MODEL_READY = False
 
 # =========================================
@@ -142,11 +148,25 @@ def parse_input(text: str) -> List[str]:
     return out
 
 # =========================================
-# MODEL KEY
+# MODEL KEY / INDEX
 # =========================================
 
 def pattern_key(seq: List[str]) -> str:
     return "".join(seq)
+
+def make_model_key(length: int, seq: List[str]) -> str:
+    return f"{length}:{pattern_key(seq)}"
+
+def rebuild_model_index() -> None:
+    global MODEL_INDEX
+    MODEL_INDEX = {}
+    for key in RAW_MODEL.keys():
+        try:
+            length_str, _ = key.split(":", 1)
+            length = int(length_str)
+            MODEL_INDEX.setdefault(length, []).append(key)
+        except Exception:
+            continue
 
 # =========================================
 # LOAD / SAVE
@@ -166,7 +186,6 @@ def load_data() -> None:
                 raw = f.read()
 
         BIG_DATA = extract_tx(raw)
-
         logging.info("Loaded BIG_DATA: %d items", len(BIG_DATA))
     except Exception as e:
         logging.exception("load_data failed: %s", e)
@@ -201,7 +220,7 @@ def load_state() -> None:
 def save_model() -> None:
     payload = {
         "meta": {
-            "pattern_len": PATTERN_LEN,
+            "pattern_lens": PATTERN_LENS,
             "train_decay": TRAIN_DECAY,
             "big_data_size": len(BIG_DATA),
         },
@@ -226,6 +245,7 @@ def load_model() -> bool:
             payload = json.load(f)
 
         RAW_MODEL = payload.get("raw", {}) or {}
+        rebuild_model_index()
         MODEL_READY = True
 
         logging.info("Loaded model from %s", MODEL_FILE)
@@ -233,6 +253,7 @@ def load_model() -> bool:
     except Exception as e:
         logging.exception("load_model failed: %s", e)
         RAW_MODEL = {}
+        MODEL_INDEX = {}
         MODEL_READY = False
         return False
 
@@ -247,28 +268,31 @@ def _update_model_entry(model: Dict[str, Dict[str, float]], key: str, nxt: str, 
     model[key][nxt] += weight
     model[key]["support"] += weight
 
-def train_raw_model(data: List[str], pattern_len: int = PATTERN_LEN, decay: float = TRAIN_DECAY) -> Dict[str, Dict[str, float]]:
+def train_raw_model(
+    data: List[str],
+    pattern_lens: List[int] = PATTERN_LENS,
+    decay: float = TRAIN_DECAY
+) -> Dict[str, Dict[str, float]]:
     """
-    Train đúng một pattern duy nhất:
-    - lấy chuỗi dài PATTERN_LEN
-    - dự đoán kết quả ngay sau chuỗi đó
-    - dữ liệu càng cũ thì weight càng giảm
+    Train chỉ từ BIG_DATA.
+    Mỗi pattern length là một nhóm riêng.
     """
     model: Dict[str, Dict[str, float]] = {}
     n = len(data)
 
-    if n < pattern_len + 1:
-        return model
+    for L in pattern_lens:
+        if n < L + 1:
+            continue
 
-    for i in range(n - pattern_len):
-        age = (n - 1) - i
-        weight = decay ** age
+        for i in range(n - L):
+            age = (n - 1) - i
+            weight = decay ** age
 
-        key = "".join(data[i:i + pattern_len])
-        nxt = data[i + pattern_len]
+            key = make_model_key(L, data[i:i + L])
+            nxt = data[i + L]
 
-        if nxt in ("T", "X"):
-            _update_model_entry(model, key, nxt, weight)
+            if nxt in ("T", "X"):
+                _update_model_entry(model, key, nxt, weight)
 
     return model
 
@@ -276,6 +300,7 @@ def train_all() -> None:
     global RAW_MODEL, MODEL_READY
 
     RAW_MODEL = train_raw_model(BIG_DATA)
+    rebuild_model_index()
     MODEL_READY = True
     save_model()
 
@@ -317,7 +342,7 @@ def decision_from_counts(c: Counter, total: float) -> str:
 def entry_vote(entry: Dict[str, float], priority: float = 1.0) -> List[Tuple[str, float]]:
     """
     Chuyển model entry thành vote.
-    Có chặn trường hợp quá lệch 100% để giảm dính cầu giả.
+    Có dùng entropy để giảm overfit, nhưng không chặn cứng quá mạnh.
     """
     t = float(entry.get("T", 0.0))
     x = float(entry.get("X", 0.0))
@@ -327,11 +352,7 @@ def entry_vote(entry: Dict[str, float], priority: float = 1.0) -> List[Tuple[str
     if support <= 0 or total <= 0:
         return []
 
-    # Nếu quá lệch tuyệt đối thì giảm độ tin cậy để tránh overfit
-    if t == 0 or x == 0:
-        certainty = 0.4
-    else:
-        certainty = abs(t - x) / total
+    certainty = abs(t - x) / total if total > 0 else 0.0
 
     entropy = 0.0
     pt = t / total
@@ -341,11 +362,10 @@ def entry_vote(entry: Dict[str, float], priority: float = 1.0) -> List[Tuple[str
     if px > 0:
         entropy -= px * math.log2(px)
 
-    # entropy thấp quá thì coi như mẫu quá cứng, dễ dính cầu fake
-    if entropy < 0.3:
-        return []
+    # entropy càng thấp thì càng giảm trọng số, nhưng không loại hẳn
+    entropy_factor = max(0.35, min(1.0, entropy / 1.0))
 
-    weight = priority * (1.0 + math.log1p(total)) * certainty
+    weight = priority * (1.0 + math.log1p(total)) * certainty * entropy_factor
     if weight <= 0:
         return []
 
@@ -355,7 +375,7 @@ def entry_vote(entry: Dict[str, float], priority: float = 1.0) -> List[Tuple[str
     ]
 
 def fallback_baseline() -> Tuple[Counter, float]:
-    source = HISTORY[-30:] if len(HISTORY) >= 6 else BIG_DATA[-200:]
+    source = BIG_DATA[-300:] if BIG_DATA else HISTORY[-30:]
     if not source:
         return Counter(), 0.0
 
@@ -364,50 +384,118 @@ def fallback_baseline() -> Tuple[Counter, float]:
     return c, total
 
 # =========================================
-# ANALYSIS - ONE PATTERN ONLY
+# RECOGNITION
 # =========================================
 
-def analyze_pattern25() -> Tuple[str, List[Tuple[str, float]]]:
-    if len(HISTORY) < PATTERN_LEN:
-        return f"🔹 CẦU THƯỜNG\n❌ Chưa đủ dữ liệu cho pattern {PATTERN_LEN}\n\n", []
+def positional_similarity(a: List[str], b: List[str]) -> float:
+    if len(a) != len(b) or not a:
+        return 0.0
+    same = sum(1 for x, y in zip(a, b) if x == y)
+    return same / len(a)
 
-    text = "🔹 CẦU THƯỜNG\n\n"
-    final_pool: List[Tuple[str, float]] = []
+def find_fuzzy_candidates(query: List[str], length: int, top_k: int = FUZZY_TOP_K) -> List[Tuple[float, str, Dict[str, float]]]:
+    """
+    Tìm các pattern gần đúng trong model theo cùng độ dài.
+    Trả về: [(similarity, full_key, entry), ...]
+    """
+    bucket = MODEL_INDEX.get(length, [])
+    if not bucket:
+        return []
 
-    history_live = HISTORY[-LIVE_HISTORY_LOOKBACK:] if len(HISTORY) > LIVE_HISTORY_LOOKBACK else HISTORY[:]
-    if len(history_live) < PATTERN_LEN:
-        pattern_source = HISTORY
-    else:
-        pattern_source = history_live
+    q = query[-length:]
+    candidates: List[Tuple[float, str, Dict[str, float]]] = []
 
-    pattern = pattern_source[-PATTERN_LEN:]
-    key = pattern_key(pattern)
+    for full_key in bucket:
+        _, pat = full_key.split(":", 1)
+        pat_seq = list(pat)
 
-    entry = RAW_MODEL.get(key)
+        sim = positional_similarity(q, pat_seq)
+        if sim < FUZZY_THRESHOLD:
+            continue
 
-    if entry:
-        votes = entry_vote(entry, priority=1.0)
-        c, total_w = weighted_counts(votes)
+        entry = RAW_MODEL.get(full_key)
+        if not entry:
+            continue
 
         support = float(entry.get("support", 0.0))
-        t_pct = round(float(entry.get("T", 0.0)) * 100 / max(support, 1.0), 1)
-        x_pct = round(float(entry.get("X", 0.0)) * 100 / max(support, 1.0), 1)
+        bonus = math.log1p(support) * sim
+        score = sim + (bonus / 10.0)
 
-        text += f"🔸 Pattern {PATTERN_LEN}: {key}\n"
-        text += f"Support: {round(support, 2)}\n"
-        text += f"T: {t_pct}% | X: {x_pct}%\n"
-        text += f"=> {decision_from_counts(c, total_w)}\n\n"
+        candidates.append((score, full_key, entry))
 
-        if support >= MIN_SUPPORT_FOR_CHOT:
-            final_pool += votes
-    else:
-        text += f"🔸 Pattern {PATTERN_LEN}: {key}\n"
-        text += "Không có khớp model\n\n"
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[:top_k]
+
+def analyze_by_model() -> Tuple[str, List[Tuple[str, float]]]:
+    """
+    Dùng HISTORY chỉ làm input query.
+    Không có chuyện HISTORY chui vào train.
+    """
+    if len(HISTORY) < min(PATTERN_LENS):
+        return (
+            f"🔹 NHẬN DIỆN THEO BIG_DATA\n"
+            f"❌ Chưa đủ dữ liệu cho các pattern {PATTERN_LENS}\n\n",
+            []
+        )
+
+    text = "🔹 NHẬN DIỆN THEO BIG_DATA\n\n"
+    final_pool: List[Tuple[str, float]] = []
+
+    history_live = HISTORY[-max(PATTERN_LENS):] if len(HISTORY) > max(PATTERN_LENS) else HISTORY[:]
+
+    for L in PATTERN_LENS:
+        if len(history_live) < L:
+            continue
+
+        query = history_live[-L:]
+        qkey = make_model_key(L, query)
+        entry = RAW_MODEL.get(qkey)
+
+        text += f"📍 Pattern {L}: {pattern_key(query)}\n"
+
+        if entry:
+            votes = entry_vote(entry, priority=1.0)
+            c, total_w = weighted_counts(votes)
+
+            support = float(entry.get("support", 0.0))
+            t_pct = round(float(entry.get("T", 0.0)) * 100 / max(support, 1.0), 1)
+            x_pct = round(float(entry.get("X", 0.0)) * 100 / max(support, 1.0), 1)
+
+            text += f"   • Khớp chính xác\n"
+            text += f"   • Support: {round(support, 2)}\n"
+            text += f"   • T: {t_pct}% | X: {x_pct}%\n"
+            text += f"   • => {decision_from_counts(c, total_w)}\n\n"
+
+            if support >= MIN_SUPPORT_FOR_CHOT:
+                final_pool += votes
+            continue
+
+        fuzzy = find_fuzzy_candidates(query, L, top_k=FUZZY_TOP_K)
+        if fuzzy:
+            text += "   • Khớp gần đúng:\n"
+            for score, full_key, cand_entry in fuzzy:
+                cand_support = float(cand_entry.get("support", 0.0))
+                votes = entry_vote(cand_entry, priority=score)
+
+                c, total_w = weighted_counts(votes)
+                t_pct = round(float(cand_entry.get("T", 0.0)) * 100 / max(cand_support, 1.0), 1)
+                x_pct = round(float(cand_entry.get("X", 0.0)) * 100 / max(cand_support, 1.0), 1)
+
+                text += f"   • {full_key.split(':', 1)[1]} | score={score:.3f} | support={cand_support:.2f}\n"
+                text += f"     T: {t_pct}% | X: {x_pct}%\n"
+                text += f"     => {decision_from_counts(c, total_w)}\n"
+
+                if cand_support >= MIN_SUPPORT_FOR_CHOT:
+                    final_pool += votes
+
+            text += "\n"
+        else:
+            text += "   • Không có khớp model\n\n"
 
     return text, final_pool
 
 def build_final_chot(raw_pool: List[Tuple[str, float]]) -> str:
-    title = "🎯 CHỐT CUỐI THEO PATTERN 25"
+    title = "🎯 CHỐT CUỐI THEO BIG_DATA"
 
     if not raw_pool:
         base_counts, base_total = fallback_baseline()
@@ -445,10 +533,10 @@ def build_final_chot(raw_pool: List[Tuple[str, float]]) -> str:
     return f"{title}\nDự đoán: {pred}\nTỷ lệ: {pct:.1f}%"
 
 def analyze_multi() -> str:
-    if len(HISTORY) < PATTERN_LEN:
-        return f"❌ Chưa đủ dữ liệu để phân tích pattern {PATTERN_LEN}"
+    if len(HISTORY) < min(PATTERN_LENS):
+        return f"❌ Chưa đủ dữ liệu để phân tích pattern {PATTERN_LENS}"
 
-    raw_text, raw_pool = analyze_pattern25()
+    raw_text, raw_pool = analyze_by_model()
     final_text = build_final_chot(raw_pool)
 
     text = "🧠 PHÂN TÍCH\n\n"
@@ -465,8 +553,9 @@ def model_status_text() -> str:
         "🧠 MODEL STATUS\n\n"
         f"READY: {MODEL_READY}\n"
         f"RAW keys: {len(RAW_MODEL)}\n"
-        f"PATTERN_LEN: {PATTERN_LEN}\n"
+        f"PATTERN_LENS: {PATTERN_LENS}\n"
         f"TRAIN_DECAY: {TRAIN_DECAY}\n"
+        f"FUZZY_THRESHOLD: {FUZZY_THRESHOLD}\n"
     )
 
 def dashboard_text() -> str:
@@ -504,8 +593,9 @@ def guide_text() -> str:
         "• 3–10 = X, 11–18 = T.\n"
         "• /reset chỉ xóa HISTORY, không đụng BIG_DATA.\n"
         "• BIG_DATA là dữ liệu gốc từ data.txt hoặc URL.\n"
+        "• Dữ liệu nhập tay chỉ để bot so sánh và nhận diện.\n"
         "• Bot đọc được cả T/X và số, kể cả có dấu -, dấu phẩy, hoặc xuống dòng.\n"
-        f"• Bot chỉ dùng đúng 1 pattern duy nhất dài {PATTERN_LEN}.\n"
+        f"• Bot dùng nhiều pattern: {PATTERN_LENS}\n"
         "• /train sẽ train lại model từ BIG_DATA và lưu ra file.\n"
         "• /reloaddata sẽ tải lại dữ liệu gốc rồi train luôn.\n"
     )
@@ -515,7 +605,7 @@ def input_hint_text() -> str:
         "➕ NHẬP DỮ LIỆU\n\n"
         "Gửi từng kết quả, hoặc gửi cả chuỗi như:\n"
         "14-14-5-11-7-8\n\n"
-        "Bot sẽ tự lưu vào HISTORY và phân tích tiếp."
+        "Bot sẽ tự lưu vào HISTORY để đối chiếu với model."
     )
 
 # =========================================
@@ -550,7 +640,7 @@ async def train_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         update,
         "✅ Train xong.\n"
         f"RAW keys: {len(RAW_MODEL)}\n"
-        f"Pattern: {PATTERN_LEN}"
+        f"Pattern lengths: {PATTERN_LENS}"
     )
 
 async def reload_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -587,7 +677,7 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if stripped == "🎯 Chốt cuối":
-        _, raw_pool = analyze_pattern25()
+        _, raw_pool = analyze_by_model()
         reply = "🎯 CHỐT CUỐI\n\n" + build_final_chot(raw_pool)
         await send_menu(update, reply)
         return
@@ -657,7 +747,7 @@ def main():
     load_state()
     load_data()
 
-    # Tải model trước, không có thì train mới
+    # Tải model trước, không có thì train mới từ BIG_DATA
     if not load_model():
         if BIG_DATA:
             train_all()
