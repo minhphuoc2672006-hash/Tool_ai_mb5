@@ -7,7 +7,7 @@ import math
 import os
 import re
 from collections import Counter
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
@@ -33,14 +33,10 @@ DATA_FILE = os.getenv("DATA_FILE", "data.txt").strip()
 STATE_FILE = os.getenv("STATE_FILE", "state.json").strip()
 MODEL_FILE = os.getenv("MODEL_FILE", "model.json").strip()
 
-MAX_MISMATCHES = int(os.getenv("MAX_MISMATCHES", "1"))
-SOFT_WEIGHT = float(os.getenv("SOFT_WEIGHT", "0.6"))
-MIN_SUPPORT_FOR_CHOT = int(os.getenv("MIN_SUPPORT_FOR_CHOT", "3"))
-
-TRAIN_DECAY = float(os.getenv("TRAIN_DECAY", "0.9995"))  # càng gần 1 càng giữ dữ liệu cũ nhiều hơn
-RAW_MAX_DEPTH = int(os.getenv("RAW_MAX_DEPTH", "6"))
-RUN_MAX_DEPTH = int(os.getenv("RUN_MAX_DEPTH", "4"))
+PATTERN_LEN = int(os.getenv("PATTERN_LEN", "25"))
+TRAIN_DECAY = float(os.getenv("TRAIN_DECAY", "0.9995"))
 LIVE_HISTORY_LOOKBACK = int(os.getenv("LIVE_HISTORY_LOOKBACK", "30"))
+MIN_SUPPORT_FOR_CHOT = float(os.getenv("MIN_SUPPORT_FOR_CHOT", "3"))
 
 # =========================================
 
@@ -50,12 +46,9 @@ logging.basicConfig(
 )
 
 BIG_DATA: List[str] = []
-BIG_RUNS: List[Tuple[str, int]] = []
 HISTORY: List[str] = []
 
 RAW_MODEL: Dict[str, Dict[str, float]] = {}
-RUN_MODEL_EXACT: Dict[str, Dict[str, float]] = {}
-RUN_MODEL_SYMBOL: Dict[str, Dict[str, float]] = {}
 MODEL_READY = False
 
 # =========================================
@@ -66,9 +59,8 @@ def menu_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton("📌 Dashboard"), KeyboardButton("➕ Nhập dữ liệu")],
         [KeyboardButton("📊 Thống kê"), KeyboardButton("🔄 Train")],
-        [KeyboardButton("🧩 Cụm"), KeyboardButton("🎯 Chốt cuối")],
-        [KeyboardButton("🧹 Reset"), KeyboardButton("🔁 Reload data")],
-        [KeyboardButton("ℹ️ Hướng dẫn")],
+        [KeyboardButton("🎯 Chốt cuối"), KeyboardButton("🧹 Reset")],
+        [KeyboardButton("🔁 Reload data"), KeyboardButton("ℹ️ Hướng dẫn")],
     ]
     return ReplyKeyboardMarkup(
         keyboard,
@@ -149,46 +141,19 @@ def parse_input(text: str) -> List[str]:
                 out.append(v)
     return out
 
-def build_runs(seq: List[str]) -> List[Tuple[str, int]]:
-    """
-    T T X X X T  -> [('T', 2), ('X', 3), ('T', 1)]
-    """
-    runs: List[Tuple[str, int]] = []
-    if not seq:
-        return runs
+# =========================================
+# MODEL KEY
+# =========================================
 
-    cur = seq[0]
-    cnt = 1
-
-    for s in seq[1:]:
-        if s == cur:
-            cnt += 1
-        else:
-            runs.append((cur, cnt))
-            cur = s
-            cnt = 1
-
-    runs.append((cur, cnt))
-    return runs
-
-def runs_to_text(runs: List[Tuple[str, int]], limit: int = 8) -> str:
-    part = runs[-limit:]
-    if not part:
-        return "(trống)"
-    return " ".join(f"{s}({n})" for s, n in part)
-
-def run_key_exact(runs: List[Tuple[str, int]]) -> str:
-    return "|".join(f"{s}{n}" for s, n in runs)
-
-def run_key_symbol(runs: List[Tuple[str, int]]) -> str:
-    return "|".join(s for s, _ in runs)
+def pattern_key(seq: List[str]) -> str:
+    return "".join(seq)
 
 # =========================================
 # LOAD / SAVE
 # =========================================
 
 def load_data() -> None:
-    global BIG_DATA, BIG_RUNS
+    global BIG_DATA
 
     raw = ""
     try:
@@ -201,14 +166,11 @@ def load_data() -> None:
                 raw = f.read()
 
         BIG_DATA = extract_tx(raw)
-        BIG_RUNS = build_runs(BIG_DATA)
 
         logging.info("Loaded BIG_DATA: %d items", len(BIG_DATA))
-        logging.info("Loaded BIG_RUNS: %d runs", len(BIG_RUNS))
     except Exception as e:
         logging.exception("load_data failed: %s", e)
         BIG_DATA = []
-        BIG_RUNS = []
 
 def save_state() -> None:
     try:
@@ -239,15 +201,11 @@ def load_state() -> None:
 def save_model() -> None:
     payload = {
         "meta": {
+            "pattern_len": PATTERN_LEN,
             "train_decay": TRAIN_DECAY,
-            "raw_max_depth": RAW_MAX_DEPTH,
-            "run_max_depth": RUN_MAX_DEPTH,
             "big_data_size": len(BIG_DATA),
-            "big_runs_size": len(BIG_RUNS),
         },
         "raw": RAW_MODEL,
-        "run_exact": RUN_MODEL_EXACT,
-        "run_symbol": RUN_MODEL_SYMBOL,
     }
 
     try:
@@ -257,7 +215,7 @@ def save_model() -> None:
         logging.exception("save_model failed: %s", e)
 
 def load_model() -> bool:
-    global RAW_MODEL, RUN_MODEL_EXACT, RUN_MODEL_SYMBOL, MODEL_READY
+    global RAW_MODEL, MODEL_READY
 
     if not os.path.exists(MODEL_FILE):
         MODEL_READY = False
@@ -268,17 +226,13 @@ def load_model() -> bool:
             payload = json.load(f)
 
         RAW_MODEL = payload.get("raw", {}) or {}
-        RUN_MODEL_EXACT = payload.get("run_exact", {}) or {}
-        RUN_MODEL_SYMBOL = payload.get("run_symbol", {}) or {}
-
         MODEL_READY = True
+
         logging.info("Loaded model from %s", MODEL_FILE)
         return True
     except Exception as e:
         logging.exception("load_model failed: %s", e)
         RAW_MODEL = {}
-        RUN_MODEL_EXACT = {}
-        RUN_MODEL_SYMBOL = {}
         MODEL_READY = False
         return False
 
@@ -293,76 +247,39 @@ def _update_model_entry(model: Dict[str, Dict[str, float]], key: str, nxt: str, 
     model[key][nxt] += weight
     model[key]["support"] += weight
 
-def train_raw_model(data: List[str], max_depth: int = RAW_MAX_DEPTH, decay: float = TRAIN_DECAY) -> Dict[str, Dict[str, float]]:
+def train_raw_model(data: List[str], pattern_len: int = PATTERN_LEN, decay: float = TRAIN_DECAY) -> Dict[str, Dict[str, float]]:
     """
-    Train model cho chuỗi thô T/X.
-    Trọng số giảm dần theo độ cũ để dữ liệu quá xa không đè dữ liệu gần.
+    Train đúng một pattern duy nhất:
+    - lấy chuỗi dài PATTERN_LEN
+    - dự đoán kết quả ngay sau chuỗi đó
+    - dữ liệu càng cũ thì weight càng giảm
     """
     model: Dict[str, Dict[str, float]] = {}
     n = len(data)
-    if n < 3:
+
+    if n < pattern_len + 1:
         return model
 
-    for i in range(n):
+    for i in range(n - pattern_len):
         age = (n - 1) - i
         weight = decay ** age
 
-        for d in range(2, max_depth + 1):
-            if i + d >= n:
-                break
+        key = "".join(data[i:i + pattern_len])
+        nxt = data[i + pattern_len]
 
-            key = "".join(data[i:i + d])
-            nxt = data[i + d]
-            if nxt in ("T", "X"):
-                _update_model_entry(model, key, nxt, weight)
+        if nxt in ("T", "X"):
+            _update_model_entry(model, key, nxt, weight)
 
     return model
 
-def train_run_models(runs: List[Tuple[str, int]], max_depth: int = RUN_MAX_DEPTH, decay: float = TRAIN_DECAY) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
-    """
-    Train model cho cụm:
-    - model exact: xét cả symbol và độ dài run
-    - model symbol: chỉ xét symbol, giúp nhận diện rộng hơn
-    """
-    exact_model: Dict[str, Dict[str, float]] = {}
-    symbol_model: Dict[str, Dict[str, float]] = {}
-
-    n = len(runs)
-    if n < 2:
-        return exact_model, symbol_model
-
-    for i in range(n):
-        age = (n - 1) - i
-        weight = decay ** age
-
-        for d in range(2, max_depth + 1):
-            if i + d >= n:
-                break
-
-            window = runs[i:i + d]
-            nxt = runs[i + d][0]
-
-            if nxt not in ("T", "X"):
-                continue
-
-            key_exact = run_key_exact(window)
-            key_symbol = run_key_symbol(window)
-
-            _update_model_entry(exact_model, key_exact, nxt, weight)
-            _update_model_entry(symbol_model, key_symbol, nxt, weight)
-
-    return exact_model, symbol_model
-
 def train_all() -> None:
-    global RAW_MODEL, RUN_MODEL_EXACT, RUN_MODEL_SYMBOL, MODEL_READY
+    global RAW_MODEL, MODEL_READY
 
     RAW_MODEL = train_raw_model(BIG_DATA)
-    RUN_MODEL_EXACT, RUN_MODEL_SYMBOL = train_run_models(BIG_RUNS)
     MODEL_READY = True
-
     save_model()
-    logging.info("Train done. RAW=%d, RUN_EXACT=%d, RUN_SYMBOL=%d",
-                 len(RAW_MODEL), len(RUN_MODEL_EXACT), len(RUN_MODEL_SYMBOL))
+
+    logging.info("Train done. RAW keys=%d", len(RAW_MODEL))
 
 # =========================================
 # SCORING / DECISION
@@ -399,8 +316,8 @@ def decision_from_counts(c: Counter, total: float) -> str:
 
 def entry_vote(entry: Dict[str, float], priority: float = 1.0) -> List[Tuple[str, float]]:
     """
-    Chuyển một entry model thành trọng số vote.
-    Support càng lớn, lệch càng mạnh thì vote càng cao.
+    Chuyển model entry thành vote.
+    Có chặn trường hợp quá lệch 100% để giảm dính cầu giả.
     """
     t = float(entry.get("T", 0.0))
     x = float(entry.get("X", 0.0))
@@ -410,9 +327,25 @@ def entry_vote(entry: Dict[str, float], priority: float = 1.0) -> List[Tuple[str
     if support <= 0 or total <= 0:
         return []
 
-    certainty = abs(t - x) / total
-    weight = priority * (1.0 + math.log1p(total)) * certainty
+    # Nếu quá lệch tuyệt đối thì giảm độ tin cậy để tránh overfit
+    if t == 0 or x == 0:
+        certainty = 0.4
+    else:
+        certainty = abs(t - x) / total
 
+    entropy = 0.0
+    pt = t / total
+    px = x / total
+    if pt > 0:
+        entropy -= pt * math.log2(pt)
+    if px > 0:
+        entropy -= px * math.log2(px)
+
+    # entropy thấp quá thì coi như mẫu quá cứng, dễ dính cầu fake
+    if entropy < 0.3:
+        return []
+
+    weight = priority * (1.0 + math.log1p(total)) * certainty
     if weight <= 0:
         return []
 
@@ -420,132 +353,6 @@ def entry_vote(entry: Dict[str, float], priority: float = 1.0) -> List[Tuple[str
         ("T", weight * (t / total)),
         ("X", weight * (x / total)),
     ]
-
-def lookup_best_model(model: Dict[str, Dict[str, float]], keys: List[str]) -> Optional[Dict[str, float]]:
-    """
-    Trả về entry đầu tiên khớp theo thứ tự ưu tiên keys.
-    """
-    for key in keys:
-        entry = model.get(key)
-        if entry and float(entry.get("support", 0.0)) > 0:
-            return entry
-    return None
-
-# =========================================
-# ANALYSIS - RAW
-# =========================================
-
-def analyze_raw_section() -> Tuple[str, List[Tuple[str, float]]]:
-    if len(HISTORY) < 3:
-        return "🔹 CẦU THƯỜNG\n❌ Chưa đủ dữ liệu\n\n", []
-
-    text = "🔹 CẦU THƯỜNG\n\n"
-    final_pool: List[Tuple[str, float]] = []
-
-    history_live = HISTORY[-LIVE_HISTORY_LOOKBACK:] if len(HISTORY) > LIVE_HISTORY_LOOKBACK else HISTORY[:]
-
-    depths = [6, 5, 4, 3]
-    for d in depths:
-        if len(history_live) < d + 1:
-            continue
-
-        pattern = history_live[-d:]
-        pattern_text = "".join(pattern)
-
-        entry = lookup_best_model(
-            RAW_MODEL,
-            ["".join(pattern)]
-        )
-
-        if entry:
-            votes = entry_vote(entry, priority=1.0)
-            c, total_w = weighted_counts(votes)
-
-            text += f"🔸 Pattern {d}: {pattern_text}\n"
-            text += f"Support: {round(float(entry.get('support', 0.0)), 2)}\n"
-            text += f"T: {round((float(entry.get('T', 0.0)) * 100 / float(entry.get('support', 1.0))), 1)}% | "
-            text += f"X: {round((float(entry.get('X', 0.0)) * 100 / float(entry.get('support', 1.0))), 1)}%\n"
-            text += f"=> {decision_from_counts(c, total_w)}\n\n"
-
-            if float(entry.get("support", 0.0)) >= MIN_SUPPORT_FOR_CHOT:
-                final_pool += votes
-        else:
-            text += f"🔸 Pattern {d}: {pattern_text}\n"
-            text += "Không có khớp model\n\n"
-
-    return text, final_pool
-
-# =========================================
-# ANALYSIS - CLUSTER
-# =========================================
-
-def analyze_cluster_section() -> Tuple[str, List[Tuple[str, float]]]:
-    if len(HISTORY) < 4:
-        return "🧩 PHÂN TÍCH CỤM\n❌ Chưa đủ dữ liệu cụm\n\n", []
-
-    current_runs = build_runs(HISTORY)
-    if len(current_runs) < 2:
-        return "🧩 PHÂN TÍCH CỤM\n❌ Chưa có cụm đủ dài\n\n", []
-
-    text = "🧩 PHÂN TÍCH CỤM\n\n"
-    final_pool: List[Tuple[str, float]] = []
-
-    for d in [4, 3, 2]:
-        if len(current_runs) < d + 1:
-            continue
-
-        pattern_runs = current_runs[-d:]
-        pattern_text = runs_to_text(pattern_runs, limit=d)
-
-        exact_key = run_key_exact(pattern_runs)
-        symbol_key = run_key_symbol(pattern_runs)
-
-        exact_entry = lookup_best_model(RUN_MODEL_EXACT, [exact_key])
-        symbol_entry = lookup_best_model(RUN_MODEL_SYMBOL, [symbol_key])
-
-        votes: List[Tuple[str, float]] = []
-
-        if exact_entry:
-            votes += entry_vote(exact_entry, priority=1.25)
-
-        if symbol_entry:
-            votes += entry_vote(symbol_entry, priority=0.9)
-
-        if votes:
-            c, total_w = weighted_counts(votes)
-
-            total_support = 0.0
-            if exact_entry:
-                total_support += float(exact_entry.get("support", 0.0))
-            if symbol_entry:
-                total_support += float(symbol_entry.get("support", 0.0))
-
-            text += f"🔸 Cụm {d}: {pattern_text}\n"
-            text += f"Support: {round(total_support, 2)}\n"
-            if exact_entry:
-                text += (
-                    f"Exact T: {round(float(exact_entry.get('T', 0.0)) * 100 / max(float(exact_entry.get('support', 1.0)), 1.0), 1)}% | "
-                    f"X: {round(float(exact_entry.get('X', 0.0)) * 100 / max(float(exact_entry.get('support', 1.0)), 1.0), 1)}%\n"
-                )
-            if symbol_entry:
-                text += (
-                    f"Symbol T: {round(float(symbol_entry.get('T', 0.0)) * 100 / max(float(symbol_entry.get('support', 1.0)), 1.0), 1)}% | "
-                    f"X: {round(float(symbol_entry.get('X', 0.0)) * 100 / max(float(symbol_entry.get('support', 1.0)), 1.0), 1)}%\n"
-                )
-
-            text += f"=> {decision_from_counts(c, total_w)}\n\n"
-
-            if total_support >= MIN_SUPPORT_FOR_CHOT:
-                final_pool += votes
-        else:
-            text += f"🔸 Cụm {d}: {pattern_text}\n"
-            text += "Không có khớp model\n\n"
-
-    return text, final_pool
-
-# =========================================
-# FINAL CHOT
-# =========================================
 
 def fallback_baseline() -> Tuple[Counter, float]:
     source = HISTORY[-30:] if len(HISTORY) >= 6 else BIG_DATA[-200:]
@@ -556,16 +363,53 @@ def fallback_baseline() -> Tuple[Counter, float]:
     total = float(sum(c.values()))
     return c, total
 
-def build_final_chot(raw_pool: List[Tuple[str, float]], cluster_pool: List[Tuple[str, float]]) -> str:
-    """
-    Chốt cuối:
-    - ưu tiên cụm
-    - raw vẫn cộng vào
-    - nếu không có gì thì dùng nền
-    """
-    title = "🎯 CHỐT CUỐI THEO CỤM" if cluster_pool else "🎯 CHỐT CUỐI THEO DỮ LIỆU"
+# =========================================
+# ANALYSIS - ONE PATTERN ONLY
+# =========================================
 
-    if not raw_pool and not cluster_pool:
+def analyze_pattern25() -> Tuple[str, List[Tuple[str, float]]]:
+    if len(HISTORY) < PATTERN_LEN:
+        return f"🔹 CẦU THƯỜNG\n❌ Chưa đủ dữ liệu cho pattern {PATTERN_LEN}\n\n", []
+
+    text = "🔹 CẦU THƯỜNG\n\n"
+    final_pool: List[Tuple[str, float]] = []
+
+    history_live = HISTORY[-LIVE_HISTORY_LOOKBACK:] if len(HISTORY) > LIVE_HISTORY_LOOKBACK else HISTORY[:]
+    if len(history_live) < PATTERN_LEN:
+        pattern_source = HISTORY
+    else:
+        pattern_source = history_live
+
+    pattern = pattern_source[-PATTERN_LEN:]
+    key = pattern_key(pattern)
+
+    entry = RAW_MODEL.get(key)
+
+    if entry:
+        votes = entry_vote(entry, priority=1.0)
+        c, total_w = weighted_counts(votes)
+
+        support = float(entry.get("support", 0.0))
+        t_pct = round(float(entry.get("T", 0.0)) * 100 / max(support, 1.0), 1)
+        x_pct = round(float(entry.get("X", 0.0)) * 100 / max(support, 1.0), 1)
+
+        text += f"🔸 Pattern {PATTERN_LEN}: {key}\n"
+        text += f"Support: {round(support, 2)}\n"
+        text += f"T: {t_pct}% | X: {x_pct}%\n"
+        text += f"=> {decision_from_counts(c, total_w)}\n\n"
+
+        if support >= MIN_SUPPORT_FOR_CHOT:
+            final_pool += votes
+    else:
+        text += f"🔸 Pattern {PATTERN_LEN}: {key}\n"
+        text += "Không có khớp model\n\n"
+
+    return text, final_pool
+
+def build_final_chot(raw_pool: List[Tuple[str, float]]) -> str:
+    title = "🎯 CHỐT CUỐI THEO PATTERN 25"
+
+    if not raw_pool:
         base_counts, base_total = fallback_baseline()
         if base_total <= 0:
             return "🎯 CHỐT CUỐI\nKhông đủ dữ liệu để chốt"
@@ -584,13 +428,7 @@ def build_final_chot(raw_pool: List[Tuple[str, float]], cluster_pool: List[Tuple
 
         return f"{title}\nDự đoán: {pred}\nTỷ lệ: {pct:.1f}%"
 
-    merged: List[Tuple[str, float]] = []
-    for r, w in raw_pool:
-        merged.append((r, w))
-    for r, w in cluster_pool:
-        merged.append((r, w * 1.2))  # ưu tiên cụm hơn raw một chút
-
-    c, total_w = weighted_counts(merged)
+    c, total_w = weighted_counts(raw_pool)
     t = c.get("T", 0.0)
     x = c.get("X", 0.0)
 
@@ -607,19 +445,15 @@ def build_final_chot(raw_pool: List[Tuple[str, float]], cluster_pool: List[Tuple
     return f"{title}\nDự đoán: {pred}\nTỷ lệ: {pct:.1f}%"
 
 def analyze_multi() -> str:
-    if len(HISTORY) < 3:
-        return "❌ Chưa đủ dữ liệu"
+    if len(HISTORY) < PATTERN_LEN:
+        return f"❌ Chưa đủ dữ liệu để phân tích pattern {PATTERN_LEN}"
 
-    raw_text, raw_pool = analyze_raw_section()
-    cluster_text, cluster_pool = analyze_cluster_section()
+    raw_text, raw_pool = analyze_pattern25()
+    final_text = build_final_chot(raw_pool)
 
     text = "🧠 PHÂN TÍCH\n\n"
     text += raw_text
-    text += cluster_text
-
-    final_text = build_final_chot(raw_pool, cluster_pool)
     text += "\n" + final_text
-
     return text
 
 # =========================================
@@ -631,21 +465,16 @@ def model_status_text() -> str:
         "🧠 MODEL STATUS\n\n"
         f"READY: {MODEL_READY}\n"
         f"RAW keys: {len(RAW_MODEL)}\n"
-        f"RUN exact keys: {len(RUN_MODEL_EXACT)}\n"
-        f"RUN symbol keys: {len(RUN_MODEL_SYMBOL)}\n"
+        f"PATTERN_LEN: {PATTERN_LEN}\n"
         f"TRAIN_DECAY: {TRAIN_DECAY}\n"
-        f"RAW_MAX_DEPTH: {RAW_MAX_DEPTH}\n"
-        f"RUN_MAX_DEPTH: {RUN_MAX_DEPTH}\n"
     )
 
 def dashboard_text() -> str:
     history_preview = " ".join(HISTORY[-20:]) if HISTORY else "(trống)"
-    cluster_preview = runs_to_text(build_runs(HISTORY), limit=8)
     return (
         "📌 DASHBOARD\n\n"
         f"📚 BIG_DATA: {len(BIG_DATA)}\n"
         f"🧠 HISTORY: {len(HISTORY)}\n"
-        f"🧩 Cụm gần nhất: {cluster_preview}\n"
         f"🔎 20 kết quả gần nhất: {history_preview}\n\n"
         f"{model_status_text()}\n"
         f"{analyze_multi()}"
@@ -666,7 +495,6 @@ def stats_text() -> str:
         f"🔥 T: {t} ({round(tp, 1)}%)\n"
         f"🧊 X: {x} ({round(xp, 1)}%)\n"
         f"📚 BIG_DATA: {len(BIG_DATA)}\n"
-        f"🧩 Cụm gần nhất: {runs_to_text(build_runs(HISTORY), limit=8)}\n"
     )
 
 def guide_text() -> str:
@@ -677,8 +505,7 @@ def guide_text() -> str:
         "• /reset chỉ xóa HISTORY, không đụng BIG_DATA.\n"
         "• BIG_DATA là dữ liệu gốc từ data.txt hoặc URL.\n"
         "• Bot đọc được cả T/X và số, kể cả có dấu -, dấu phẩy, hoặc xuống dòng.\n"
-        "• Mục 🧩 Cụm sẽ xem dữ liệu theo chuỗi chạy liên tiếp.\n"
-        "• Mục 🎯 Chốt cuối sẽ gom hết rồi chốt một dòng riêng.\n"
+        f"• Bot chỉ dùng đúng 1 pattern duy nhất dài {PATTERN_LEN}.\n"
         "• /train sẽ train lại model từ BIG_DATA và lưu ra file.\n"
         "• /reloaddata sẽ tải lại dữ liệu gốc rồi train luôn.\n"
     )
@@ -723,13 +550,13 @@ async def train_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         update,
         "✅ Train xong.\n"
         f"RAW keys: {len(RAW_MODEL)}\n"
-        f"RUN exact keys: {len(RUN_MODEL_EXACT)}\n"
-        f"RUN symbol keys: {len(RUN_MODEL_SYMBOL)}"
+        f"Pattern: {PATTERN_LEN}"
     )
 
 async def reload_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_admin(update.effective_user.id):
         return
+
     load_data()
     if BIG_DATA:
         train_all()
@@ -759,24 +586,9 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await train_cmd(update, ctx)
         return
 
-    if stripped == "🧩 Cụm":
-        cluster_text, cluster_pool = analyze_cluster_section()
-        reply = cluster_text
-        reply += "🎯 KẾT CỤM\n"
-        if cluster_pool:
-            c, total_w = weighted_counts(cluster_pool)
-            reply += build_final_chot([], cluster_pool) + "\n"
-            reply += f"Độ lệch: {abs((c.get('T', 0.0) - c.get('X', 0.0))):.1f}"
-        else:
-            reply += "Chưa đủ dữ liệu cụm để chốt"
-        await send_menu(update, reply)
-        return
-
     if stripped == "🎯 Chốt cuối":
-        raw_text, raw_pool = analyze_raw_section()
-        cluster_text, cluster_pool = analyze_cluster_section()
-        reply = build_final_chot(raw_pool, cluster_pool)
-        reply = "🎯 CHỐT CUỐI\n\n" + reply
+        _, raw_pool = analyze_pattern25()
+        reply = "🎯 CHỐT CUỐI\n\n" + build_final_chot(raw_pool)
         await send_menu(update, reply)
         return
 
@@ -845,7 +657,7 @@ def main():
     load_state()
     load_data()
 
-    # Nếu có model cũ thì tải trước, không có thì train mới
+    # Tải model trước, không có thì train mới
     if not load_model():
         if BIG_DATA:
             train_all()
