@@ -11,7 +11,13 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 # ================= CONFIG =================
 
@@ -50,7 +56,6 @@ logging.basicConfig(
 BIG_DATA: List[str] = []
 HISTORY: List[str] = []
 
-# Model dạng phẳng:
 # key = "25:TXTX..."
 # value = {"T": ..., "X": ..., "support": ...}
 RAW_MODEL: Dict[str, Dict[str, float]] = {}
@@ -234,10 +239,11 @@ def save_model() -> None:
         logging.exception("save_model failed: %s", e)
 
 def load_model() -> bool:
-    global RAW_MODEL, MODEL_READY
+    global RAW_MODEL, MODEL_READY, MODEL_INDEX
 
     if not os.path.exists(MODEL_FILE):
         MODEL_READY = False
+        MODEL_INDEX = {}
         return False
 
     try:
@@ -342,7 +348,7 @@ def decision_from_counts(c: Counter, total: float) -> str:
 def entry_vote(entry: Dict[str, float], priority: float = 1.0) -> List[Tuple[str, float]]:
     """
     Chuyển model entry thành vote.
-    Có dùng entropy để giảm overfit, nhưng không chặn cứng quá mạnh.
+    Có dùng entropy để giảm overfit, nhưng không chặn hẳn quá mạnh.
     """
     t = float(entry.get("T", 0.0))
     x = float(entry.get("X", 0.0))
@@ -362,7 +368,6 @@ def entry_vote(entry: Dict[str, float], priority: float = 1.0) -> List[Tuple[str
     if px > 0:
         entropy -= px * math.log2(px)
 
-    # entropy càng thấp thì càng giảm trọng số, nhưng không loại hẳn
     entropy_factor = max(0.35, min(1.0, entropy / 1.0))
 
     weight = priority * (1.0 + math.log1p(total)) * certainty * entropy_factor
@@ -617,124 +622,147 @@ async def send_menu(update: Update, text: str) -> None:
         await update.message.reply_text(text, reply_markup=menu_keyboard())
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not is_admin(update.effective_user.id):
-        return
-    await send_menu(update, "Bot đã sẵn sàng 🔥")
+    try:
+        if not update.effective_user or not is_admin(update.effective_user.id):
+            return
+        await send_menu(update, "Bot đã sẵn sàng 🔥")
+    except Exception as e:
+        logging.exception("start failed: %s", e)
 
 async def reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not is_admin(update.effective_user.id):
-        return
-    HISTORY.clear()
-    save_state()
-    await send_menu(update, "✅ Reset xong phần lịch sử nhập tay. BIG_DATA vẫn giữ nguyên.")
-
-async def train_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not is_admin(update.effective_user.id):
-        return
-    if not BIG_DATA:
-        await send_menu(update, "❌ Chưa có BIG_DATA để train.")
-        return
-
-    train_all()
-    await send_menu(
-        update,
-        "✅ Train xong.\n"
-        f"RAW keys: {len(RAW_MODEL)}\n"
-        f"Pattern lengths: {PATTERN_LENS}"
-    )
-
-async def reload_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not is_admin(update.effective_user.id):
-        return
-
-    load_data()
-    if BIG_DATA:
-        train_all()
-        await send_menu(update, f"🔄 Đã tải lại BIG_DATA: {len(BIG_DATA)} và train lại model xong.")
-    else:
-        await send_menu(update, "❌ Không tải được BIG_DATA.")
-
-async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not is_admin(update.effective_user.id):
-        return
-
-    if not update.message:
-        return
-
-    text = update.message.text or ""
-    stripped = text.strip()
-
-    if stripped == "📌 Dashboard":
-        await send_menu(update, dashboard_text())
-        return
-
-    if stripped == "📊 Thống kê":
-        await send_menu(update, stats_text())
-        return
-
-    if stripped == "🔄 Train":
-        await train_cmd(update, ctx)
-        return
-
-    if stripped == "🎯 Chốt cuối":
-        _, raw_pool = analyze_by_model()
-        reply = "🎯 CHỐT CUỐI\n\n" + build_final_chot(raw_pool)
-        await send_menu(update, reply)
-        return
-
-    if stripped == "🧹 Reset":
+    try:
+        if not update.effective_user or not is_admin(update.effective_user.id):
+            return
         HISTORY.clear()
         save_state()
         await send_menu(update, "✅ Reset xong phần lịch sử nhập tay. BIG_DATA vẫn giữ nguyên.")
-        return
+    except Exception as e:
+        logging.exception("reset failed: %s", e)
+        await send_menu(update, f"❌ Lỗi reset: {e}")
 
-    if stripped == "ℹ️ Hướng dẫn":
-        await send_menu(update, guide_text())
-        return
+async def train_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not update.effective_user or not is_admin(update.effective_user.id):
+            return
+        if not BIG_DATA:
+            await send_menu(update, "❌ Chưa có BIG_DATA để train.")
+            return
 
-    if stripped == "➕ Nhập dữ liệu":
-        await send_menu(update, input_hint_text())
-        return
-
-    if stripped == "🔁 Reload data":
-        await reload_data(update, ctx)
-        return
-
-    vals = parse_input(text)
-    if not vals:
-        return
-
-    added: List[str] = []
-    ignored: List[str] = []
-
-    for v in vals:
-        if v in ("T", "X"):
-            HISTORY.append(v)
-            added.append(v)
-        else:
-            ignored.append(v)
-
-    if not added:
+        train_all()
         await send_menu(
             update,
-            f"⚠️ Không có giá trị hợp lệ.\nDữ liệu nhận: {vals}"
+            "✅ Train xong.\n"
+            f"RAW keys: {len(RAW_MODEL)}\n"
+            f"Pattern lengths: {PATTERN_LENS}"
         )
-        return
+    except Exception as e:
+        logging.exception("train_cmd failed: %s", e)
+        await send_menu(update, f"❌ Lỗi train: {e}")
 
-    save_state()
+async def reload_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not update.effective_user or not is_admin(update.effective_user.id):
+            return
 
-    result = analyze_multi()
-    reply = (
-        f"📥 Nhận: {vals}\n"
-        f"➡️ {' '.join(added)}"
-    )
+        load_data()
+        if BIG_DATA:
+            train_all()
+            await send_menu(update, f"🔄 Đã tải lại BIG_DATA: {len(BIG_DATA)} và train lại model xong.")
+        else:
+            await send_menu(update, "❌ Không tải được BIG_DATA.")
+    except Exception as e:
+        logging.exception("reload_data failed: %s", e)
+        await send_menu(update, f"❌ Lỗi reload data: {e}")
 
-    if ignored:
-        reply += f"\n⚠️ Bỏ qua: {ignored}"
+async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not update.effective_user or not is_admin(update.effective_user.id):
+            return
 
-    reply += f"\n\n{result}"
+        if not update.message:
+            return
 
-    await send_menu(update, reply)
+        text = update.message.text or ""
+        stripped = text.strip()
+
+        if stripped == "📌 Dashboard":
+            await send_menu(update, dashboard_text())
+            return
+
+        if stripped == "📊 Thống kê":
+            await send_menu(update, stats_text())
+            return
+
+        if stripped == "🔄 Train":
+            await train_cmd(update, ctx)
+            return
+
+        if stripped == "🎯 Chốt cuối":
+            _, raw_pool = analyze_by_model()
+            reply = "🎯 CHỐT CUỐI\n\n" + build_final_chot(raw_pool)
+            await send_menu(update, reply)
+            return
+
+        if stripped == "🧹 Reset":
+            HISTORY.clear()
+            save_state()
+            await send_menu(update, "✅ Reset xong phần lịch sử nhập tay. BIG_DATA vẫn giữ nguyên.")
+            return
+
+        if stripped == "ℹ️ Hướng dẫn":
+            await send_menu(update, guide_text())
+            return
+
+        if stripped == "➕ Nhập dữ liệu":
+            await send_menu(update, input_hint_text())
+            return
+
+        if stripped == "🔁 Reload data":
+            await reload_data(update, ctx)
+            return
+
+        vals = parse_input(text)
+        if not vals:
+            await send_menu(update, "⚠️ Không đọc được dữ liệu. Hãy gửi số từ 3 đến 18 hoặc T/X.")
+            return
+
+        added: List[str] = []
+        ignored: List[str] = []
+
+        for v in vals:
+            if v in ("T", "X"):
+                HISTORY.append(v)
+                added.append(v)
+            else:
+                ignored.append(v)
+
+        if not added:
+            await send_menu(update, f"⚠️ Không có giá trị hợp lệ.\nDữ liệu nhận: {vals}")
+            return
+
+        save_state()
+
+        result = analyze_multi()
+        reply = (
+            f"📥 Nhận: {vals}\n"
+            f"➡️ {' '.join(added)}"
+        )
+
+        if ignored:
+            reply += f"\n⚠️ Bỏ qua: {ignored}"
+
+        reply += f"\n\n{result}"
+        await send_menu(update, reply)
+
+    except Exception as e:
+        logging.exception("handle failed: %s", e)
+        try:
+            await send_menu(update, f"❌ Bot bị lỗi khi xử lý tin nhắn: {e}")
+        except Exception:
+            pass
+
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    logging.exception("Global error: %s", ctx.error)
 
 # =========================================
 # MAIN
@@ -760,6 +788,7 @@ def main():
     app.add_handler(CommandHandler("reloaddata", reload_data))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+    app.add_error_handler(error_handler)
 
     print("Bot đang chạy...")
     app.run_polling()
